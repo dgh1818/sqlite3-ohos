@@ -1,3 +1,9 @@
+> [!IMPORTANT]
+>
+> There is currently a crash issue with this library when submitting for review to generate a signed Release package (see details in [#1](https://github.com/SageMik/sqlite3-ohos.dart/issues/1) ). Please do not use it.
+>
+> This crash is quite tricky, and since we aren't very knowledgeable in this area, we hope that experts will not hesitate to offer their insights and help us resolve this problem together.
+
 # sqlite3-ohos.dart
 
 [中文](README.md) | **English**

@@ -1,3 +1,10 @@
+> [!IMPORTANT]
+> 
+> 此库目前存在提交审核打出正式签名 Release 包崩溃的问题（详见 [#1](https://github.com/SageMik/sqlite3-ohos.dart/issues/1) ），请不要使用。
+> 
+> 该崩溃问题较为棘手，才疏学浅，希望有大佬不吝赐教，一同解决此问题。
+
+
 # sqlite3-ohos.dart
 
 **中文** | [English](README_EN.md)

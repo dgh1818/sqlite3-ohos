@@ -6,6 +6,7 @@ export 'src/constants.dart';
 export 'src/database.dart';
 export 'src/exception.dart';
 export 'src/functions.dart';
+export 'src/jsonb.dart';
 export 'src/result_set.dart';
 export 'src/sqlite3.dart';
 export 'src/statement.dart'

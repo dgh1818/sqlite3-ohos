@@ -32,7 +32,7 @@ jobs:
         working-directory: sqlite3_connection_pool
         env:
           OHOS_SDK_NATIVE: ${{ steps.setup-ohos.outputs.ohos_sdk_native }}
-        run: ./tool/build_ohos.sh
+        run: bash ./tool/build_ohos.sh
       - name: Verify OHOS library dependencies
         env:
           OHOS_SDK_NATIVE: ${{ steps.setup-ohos.outputs.ohos_sdk_native }}

@@ -4,5 +4,14 @@
     ],
     "cSpell.words": [
         "Patchset"
-    ]
+    ],
+    "markdown.extension.toc.levels": "2..6",
+    "markdown.extension.toc.omittedFromToc": {
+        "sqlite3/README.md": [
+            "## 目录"
+        ],
+        "sqlite3/README_EN.md": [
+            "## Contents"
+        ]
+    }
 }

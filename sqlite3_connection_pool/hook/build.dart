@@ -11,7 +11,7 @@ Future<void> main(List<String> args) {
 
     final sourceRoot = input.packageRoot;
     final config = input.config.code;
-    final isOhosBuild = _isOhosBuild(input.userDefines);
+    final isOhosBuild = _isOhosBuild(input.userDefines, config);
     final outputName = config.targetOS.dylibFileName('sqlite3_connection_pool');
 
     // For versions of this package that are published to pub.dev, assets for
@@ -113,10 +113,34 @@ Future<void> main(List<String> args) {
   });
 }
 
-bool _isOhosBuild(HookInputUserDefines userDefines) {
-  return userDefines['target'] == 'ohos' ||
+bool _isOhosBuild(HookInputUserDefines userDefines, CodeConfig config) {
+  if (userDefines['target'] == 'ohos' ||
+      userDefines['target_os'] == 'ohos' ||
       userDefines['platform'] == 'ohos' ||
-      userDefines['ohos'] == true;
+      userDefines['ohos'] == true) {
+    return true;
+  }
+
+  if (config.targetOS != OS.linux ||
+      config.targetArchitecture != Architecture.arm64) {
+    return false;
+  }
+
+  final cCompiler = config.cCompiler;
+  if (cCompiler == null) {
+    return false;
+  }
+
+  return _isOhosToolchain(cCompiler.archiver) ||
+      _isOhosToolchain(cCompiler.compiler) ||
+      _isOhosToolchain(cCompiler.linker);
+}
+
+bool _isOhosToolchain(Uri tool) {
+  final path = tool.toString().replaceAll(r'\', '/').toLowerCase();
+  return path.contains('openharmony') ||
+      path.contains('harmonyos') ||
+      path.contains('/ohos/');
 }
 
 const _prebuiltAssets = {

@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:js_interop';
 import 'dart:math';
 
-import 'package:stream_channel/stream_channel.dart';
 import 'package:web/web.dart' hide Request, Response, Notification;
 
 import 'locks.dart';
@@ -23,12 +22,21 @@ extension type WebEndpoint._(JSObject _) implements JSObject {
     required String? lockName,
   });
 
-  StreamChannel<Message> connect() {
-    return _channel(port, lockName, null);
+  ConnectableChannel connect() {
+    return ConnectableChannel._(port, lockName, null);
   }
 }
 
-Future<(WebEndpoint, StreamChannel<Message>)> createChannel() async {
+final class ConnectableChannel {
+  final MessagePort localPort;
+  final String? lockName;
+  final HeldLock? lock;
+  EventTarget? injectErrors;
+
+  ConnectableChannel._(this.localPort, this.lockName, this.lock);
+}
+
+Future<(WebEndpoint, ConnectableChannel)> createChannel() async {
   final webChannel = MessageChannel();
   final locks = WebLocks.instance;
 
@@ -47,7 +55,7 @@ Future<(WebEndpoint, StreamChannel<Message>)> createChannel() async {
     lock = await locks.request(lockName);
   }
 
-  final channel = _channel(webChannel.port2, lockName, lock);
+  final channel = ConnectableChannel._(webChannel.port2, lockName, lock);
   return (WebEndpoint(port: webChannel.port1, lockName: lockName), channel);
 }
 
@@ -61,44 +69,11 @@ String _randomLockName() {
   return buffer.toString();
 }
 
-StreamChannel<Message> _channel(
-    MessagePort port, String? lockName, HeldLock? lock) {
-  final controller = StreamChannelController<Message>();
-  port.start();
-  EventStreamProviders.messageEvent.forTarget(port).listen((event) {
-    final message = event.data;
-
-    if (message == _disconnectMessage.toJS) {
-      // Other end has closed the connection
-      controller.local.sink.close();
-    } else {
-      controller.local.sink.add(Message.deserialize(message as JSObject));
-    }
-  });
-
-  controller.local.stream.listen((msg) {
-    msg.sendToPort(port);
-  }, onDone: () {
-    // Closed locally, inform the other end.
-    port
-      ..postMessage(_disconnectMessage.toJS)
-      ..close();
-    lock?.release();
-  });
-
-  if (lock == null && lockName != null) {
-    // Once this side is able to acquire the lock, the connection is closed.
-    WebLocks.instance!.request(lockName).then((lock) {
-      controller.local.sink.close();
-      lock.release();
-    });
-  }
-
-  return controller.foreign;
-}
-
 abstract base class ProtocolChannel extends RequestHandler {
-  final StreamChannel<Message> _channel;
+  final MessagePort _port;
+  final Completer<void> _closed = Completer();
+  StreamSubscription<void>? _incomingMessagesSubscription;
+  StreamSubscription<void>? _errorSubscription;
 
   var _nextRequestId = 0;
   final Map<int, Completer<Response>> _responses = {};
@@ -107,53 +82,83 @@ abstract base class ProtocolChannel extends RequestHandler {
   /// allows aborting them.
   final Map<int, AbortController> _handlingRequests = {};
 
-  ProtocolChannel(this._channel) {
-    _channel.stream.listen(_handleIncoming, onError: (e) {
-      close(e);
-    });
+  ProtocolChannel(ConnectableChannel connectable)
+    : _port = connectable.localPort {
+    _port.start();
+
+    _incomingMessagesSubscription = EventStreamProviders.messageEvent
+        .forTarget(_port)
+        .listen((event) {
+          final data = event.data;
+          if (data.equals(_disconnectMessage.toJS).toDart) {
+            _markClosed();
+            return;
+          }
+
+          _handleIncoming(event.data as Message);
+        });
+
+    if (connectable.injectErrors case final injectErrors?) {
+      _errorSubscription = EventStreamProviders.errorEvent
+          .forTarget(injectErrors)
+          .listen((event) {
+            final error = (event as ErrorEvent).error;
+            _markClosed(error);
+          });
+    }
+
+    final lockName = connectable.lockName;
+    if (connectable.lock == null && lockName != null) {
+      // Once this side is able to acquire the lock, the connection is closed.
+      WebLocks.instance!.request(lockName).then((lock) {
+        _markClosed();
+        lock.release();
+      });
+    }
   }
 
-  Future<void> get closed => _channel.sink.done;
+  Future<void> get closed => _closed.future;
+
+  void _send(Message message) {
+    message.sendToPort(_port);
+  }
 
   /// Handle an incoming message from the client.
   void _handleIncoming(Message message) async {
-    switch (message) {
-      case Response(:final requestId):
-        _responses.remove(requestId)?.complete(message);
-        break;
-      case Request():
+    dispatchMessage(
+      message,
+      whenResponse: (response) {
+        _responses.remove(response.requestId)?.complete(response);
+      },
+      whenRequest: (request) async {
         Response response;
 
-        final abortController =
-            _handlingRequests[message.requestId] = AbortController();
+        final requestId = request.requestId;
+        final abortController = _handlingRequests[requestId] =
+            AbortController();
 
         try {
-          response = await message.dispatchTo(this, abortController.signal);
+          response = await dispatchRequest(request, abortController.signal);
         } catch (e, s) {
           if (e is! AbortException) {
             console.error('Error in worker: ${e.toString()}'.toJS);
             console.error('Original trace: $s'.toJS);
           }
 
-          response = ErrorResponse(
-            message: e.toString(),
-            requestId: message.requestId,
-            serializedException: e,
-          );
+          response = ErrorResponseUtils.wrapException(requestId, e);
         } finally {
-          _handlingRequests.remove(message.requestId);
+          _handlingRequests.remove(requestId);
         }
 
-        _channel.sink.add(response);
-      case Notification():
-        handleNotification(message);
-      case AbortRequest(:final requestId):
-        if (_handlingRequests.remove(requestId) case final token?) {
+        _send(response);
+      },
+      whenNotification: handleNotification,
+      whenAbortRequest: (abort) {
+        if (_handlingRequests.remove(abort.requestId) case final token?) {
           token.abort();
         }
-      case StartFileSystemServer():
-        throw StateError('Should only be a top-level message');
-    }
+      },
+    );
   }
 
   /// Sends a request to the other end and expects a response of the
@@ -167,26 +172,31 @@ abstract base class ProtocolChannel extends RequestHandler {
   /// If [abortTrigger] is given and completes before this request is completed,
   /// a request to cancel the request is sent to the remote.
   Future<Res> sendRequest<Res extends Response>(
-      Request request, MessageType<Res> expectedType,
-      {Future<void>? abortTrigger}) async {
+    Request request,
+    MessageType<Res> expectedType, {
+    Future<void>? abortTrigger,
+  }) async {
+    if (_closed.isCompleted) {
+      throw ChannelClosedException._();
+    }
+
     final id = _nextRequestId++;
     final completer = _responses[id] = Completer.sync();
 
-    _channel.sink.add(request..requestId = id);
+    _send(request..requestId = id);
     var hasResponse = false;
 
     if (abortTrigger != null) {
       abortTrigger.whenComplete(() {
         if (!hasResponse) {
-          _channel.sink.add(AbortRequest(requestId: id));
+          _send(newAbortRequest(requestId: id));
         }
       });
     }
 
     final response = await completer.future;
     hasResponse = true;
-    hasResponse = true;
-    if (response.type == expectedType) {
+    if (response.type == expectedType.name) {
       return response as Res;
     } else {
       throw response.interpretAsError();
@@ -194,50 +204,42 @@ abstract base class ProtocolChannel extends RequestHandler {
   }
 
   void sendNotification(Notification notification) {
-    _channel.sink.add(notification);
+    _send(notification);
   }
 
   void handleNotification(Notification notification);
 
-  Future<void> close([Object? error]) async {
-    await _channel.sink.close();
+  Future<void> close([Object? error]) {
+    _markClosed(error);
+    return closed;
+  }
+
+  void _markClosed([Object? error]) {
+    if (_closed.isCompleted) return;
+
+    _port.postMessage(_disconnectMessage.toJS);
+    _incomingMessagesSubscription?.cancel();
+    _errorSubscription?.cancel();
 
     for (final response in _responses.values) {
-      response.completeError(
-          StateError('Channel closed before receiving response: $error'));
+      response.completeError(ChannelClosedException._(error));
     }
     _responses.clear();
+
+    _closed.complete();
   }
 }
 
-extension InjectErrors<T> on StreamChannel<T> {
-  /// Returns a stream channel reporting error events from [target] through its
-  /// [StreamChannel.stream].
-  StreamChannel<T> injectErrorsFrom(EventTarget target) {
-    return changeStream((original) {
-      return Stream.multi((listener) {
-        // Listen to the original stream...
-        final upstreamSubscription = original.listen(
-          listener.addSync,
-          onDone: listener.closeSync,
-          onError: listener.addErrorSync,
-          cancelOnError: false,
-        );
+/// An exception thrown when a request is sent over a closed channel to a
+/// worker.
+final class ChannelClosedException implements Exception {
+  /// The original error causing the channel to be closed.
+  final Object? closeReason;
 
-        // And also to errors which are forwarded to the listener
-        final errorSubscription = EventStreamProviders.errorEvent
-            .forTarget(target)
-            .listen(listener.addErrorSync);
+  ChannelClosedException._([this.closeReason]);
 
-        // Don't pause the error subscription, but propagate pauses upstream.
-        listener
-          ..onPause = upstreamSubscription.pause
-          ..onResume = upstreamSubscription.resume
-          ..onCancel = () async {
-            await upstreamSubscription.cancel();
-            await errorSubscription.cancel();
-          };
-      });
-    });
+  @override
+  String toString() {
+    return 'Channel to database worker is closed: $closeReason';
   }
 }

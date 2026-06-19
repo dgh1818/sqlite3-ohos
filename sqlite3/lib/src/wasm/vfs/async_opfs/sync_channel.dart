@@ -31,7 +31,8 @@ class RequestResponseSynchronizer {
     }
 
     return RequestResponseSynchronizer._(
-        buffer ?? SharedArrayBuffer(_byteLength));
+      buffer ?? SharedArrayBuffer(_byteLength),
+    );
   }
 
   /// Creates a shared buffer and fills it with the initial state suitable for
@@ -64,7 +65,11 @@ class RequestResponseSynchronizer {
 
   String waitForRequest() {
     return Atomics.waitWithTimeout(
-        int32View, _requestIndex, -1, asyncIdleWaitTimeMs);
+      int32View,
+      _requestIndex,
+      -1,
+      asyncIdleWaitTimeMs,
+    );
   }
 
   int takeOpcode() {
@@ -91,8 +96,8 @@ class MessageSerializer {
   final Uint8List byteView;
 
   MessageSerializer(this.buffer)
-      : dataView = buffer.asByteData(metaOffset, metaSize),
-        byteView = buffer.asUint8List();
+    : dataView = buffer.asByteData(metaOffset, metaSize),
+      byteView = buffer.asUint8List();
 
   void write(Message message) {
     if (message is EmptyMessage) {
@@ -116,7 +121,12 @@ class MessageSerializer {
 
   String _readString(int offset) {
     final length = dataView.getInt32(offset);
-    return utf8.decode(buffer.asUint8ListSlice(offset + 4, length));
+    // Browsers don't allow TextDecoder.decode on shared array buffers
+    // (https://github.com/whatwg/encoding/issues/172). So, we copy.
+    final originalSlice = buffer.asUint8ListSlice(offset + 4, length);
+    final copy = Uint8List.fromList(originalSlice);
+
+    return utf8.decode(copy);
   }
 
   void _writeString(int offset, String data) {
@@ -160,10 +170,7 @@ enum WorkerOperation<Req extends Message, Res extends Message> {
     MessageSerializer.readNameAndFlags,
     MessageSerializer.readFlags,
   ),
-  xRead<Flags, Flags>(
-    MessageSerializer.readFlags,
-    MessageSerializer.readFlags,
-  ),
+  xRead<Flags, Flags>(MessageSerializer.readFlags, MessageSerializer.readFlags),
   xWrite<Flags, EmptyMessage>(
     MessageSerializer.readFlags,
     MessageSerializer.readEmpty,
@@ -199,8 +206,7 @@ enum WorkerOperation<Req extends Message, Res extends Message> {
   stopServer<EmptyMessage, EmptyMessage>(
     MessageSerializer.readEmpty,
     MessageSerializer.readEmpty,
-  ),
-  ;
+  );
 
   final Req Function(MessageSerializer) readRequest;
   final Res Function(MessageSerializer) readResponse;

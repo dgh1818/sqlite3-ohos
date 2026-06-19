@@ -1,3 +1,53 @@
+## 0.9.1 (unreleased)
+
+- Avoid races when opening a database in multiple tabs causing OPFS to be reported as unsupported.
+
+## 0.9.0
+
+- __Breaking__: Add `WorkerEnvironment.close()` to close workers.
+- Add `WebSqlite.close` to close dedicated workers opened for a web sqlite instance.
+
+## 0.8.1
+
+- Throw when new requests are made to a database closed remotely.
+
+## 0.8.0
+
+- Remove `stream_channel` dependency with custom implementation, slightly decreasing compiled size.
+- __Breaking__: Use strings instead of URLs to reduce code size.
+- __Breaking__: Custom Dart objects can no longer be serialized via `serializeParameters` and `serializeResultSet`.
+  Only SQLite values are supported.
+- __Breaking__: Remove `opfsAtomics` file system implementation. The new `opfsWithExternalLocksWorkaround` supports
+  the same browsers while being faster and not requiring special headers.
+- Fix raw file system writes not acquiring database locks.
+- Optimize use of navigator locks to avoid acquiring them in single-tab scenarios.
+
+## 0.7.1
+
+- Fix internal mutex throwing when not given an abort signal.
+- Fix internal mutex never aborting when given a signal that has already been aborted.
+
+## 0.7.0
+
+- __Breaking__: Introduce `CustomClientRequest` and `CustomClientDatabaseRequest` classes representing
+  client requests. They expose an abort signal for requests and a way to interact with database locks.
+- Add `LockToken? token` and `Future<void>? abortTrigger` parameters to `Database.customRequest`.
+
+## 0.6.0
+
+- Replace `worker` URI parameter with `WorkerConnector` interface. Use
+  `WorkerConnector.defaultWorkers` to keep passing an URI.
+- Refactor worker messages to use JS-interop objects directly instead of
+  serializing Dart objects. This makes the package slightly more efficient.
+
+## 0.5.0
+
+- Use version 3 of `package:sqlite3`.
+
+## 0.4.1
+
+- Support older versions of `package:meta`.
+
 ## 0.4.0
 
 - Remove `userVersion` and `setUserVersion`. Users should run the pragma statements manually.

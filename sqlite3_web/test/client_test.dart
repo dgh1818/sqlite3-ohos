@@ -15,12 +15,12 @@ void main() {
     expect(all, [
       DatabaseImplementation.opfsShared,
       DatabaseImplementation.opfsWithExternalLocks,
-      DatabaseImplementation.opfsAtomics,
+      DatabaseImplementation.opfsWithExternalLocksWorkaround,
       DatabaseImplementation.indexedDbShared,
       DatabaseImplementation.indexedDbUnsafeWorker,
       DatabaseImplementation.indexedDbUnsafeLocal,
       DatabaseImplementation.inMemoryShared,
-      DatabaseImplementation.inMemoryLocal
+      DatabaseImplementation.inMemoryLocal,
     ]);
   });
 }

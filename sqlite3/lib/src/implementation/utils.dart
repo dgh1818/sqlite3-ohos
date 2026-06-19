@@ -1,6 +1,5 @@
 import '../constants.dart';
 import 'bindings.dart';
-import 'exception.dart';
 
 extension BigIntRangeCheck on BigInt {
   BigInt get checkRange {
@@ -9,6 +8,9 @@ extension BigIntRangeCheck on BigInt {
     }
     return this;
   }
+
+  static final bigIntMinValue64 = -(BigInt.one << 63);
+  static final bigIntMaxValue64 = (BigInt.one << 63) - BigInt.one;
 }
 
 int eTextRep(bool deterministic, bool directOnly, bool subtype) {
@@ -25,16 +27,6 @@ int eTextRep(bool deterministic, bool directOnly, bool subtype) {
   }
 
   return flags;
-}
-
-extension HandleResult<T> on SqliteResult<T> {
-  T okOrThrowOutsideOfDatabase(RawSqliteBindings bindings) {
-    if (resultCode != SqlError.SQLITE_OK) {
-      throw createExceptionOutsideOfDatabase(bindings, resultCode);
-    }
-
-    return result;
-  }
 }
 
 extension ReadDartValue on RawSqliteValue {

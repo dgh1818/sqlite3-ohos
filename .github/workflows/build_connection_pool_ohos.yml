@@ -1,0 +1,46 @@
+name: Build OHOS connection pool
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - '*ohos*'
+      - 'br_*'
+    paths:
+      - '.github/workflows/build_connection_pool_ohos.yml'
+      - 'sqlite3_connection_pool/**'
+
+permissions: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Setup OpenHarmony SDK
+        id: setup-ohos
+        uses: openharmony-rs/setup-ohos-sdk@v1.0.0
+        with:
+          version: 6.1
+          components: native
+      - name: Install Rust target
+        run: rustup target add aarch64-unknown-linux-ohos
+      - name: Build OHOS pool library
+        working-directory: sqlite3_connection_pool
+        env:
+          OHOS_SDK_NATIVE: ${{ steps.setup-ohos.outputs.ohos_sdk_native }}
+        run: ./tool/build_ohos.sh
+      - name: Verify OHOS library dependencies
+        env:
+          OHOS_SDK_NATIVE: ${{ steps.setup-ohos.outputs.ohos_sdk_native }}
+        run: |
+          "$OHOS_SDK_NATIVE/llvm/bin/llvm-readelf" -d sqlite3_connection_pool/out/libsqlite3_connection_pool.ohos_aarch64.so | tee sqlite3_connection_pool/out/ohos_dynamic.txt
+          ! grep -E 'libgcc_s|libc\.so\.6' sqlite3_connection_pool/out/ohos_dynamic.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: connection-pool-ohos
+          path: sqlite3_connection_pool/out/libsqlite3_connection_pool.ohos_aarch64.so
+          if-no-files-found: error

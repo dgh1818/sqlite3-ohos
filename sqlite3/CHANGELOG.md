@@ -1,3 +1,99 @@
+## 3.3.3
+
+- Restore support for SQLCipher (thanks to [@davidmartos96](https://github.com/davidmartos96)!).
+- Fix crash when loading IndexedDB databases with blocks past the file length ([#380](https://github.com/simolus3/sqlite3.dart/issues/380)).
+- Don't uninstall update hooks when closing databases if no update hooks
+  were installed by this package.
+
+## 3.3.2
+
+- Support `package:native_toolchain_c` versions `0.18.x` and `0.19.x`.
+- Support `hooks` versions `2.x`.
+- Upgrade to SQLite version 3.53.1.
+- Allow disabling `BigInt` support via `-Dsqlite3.dartbigints=false`, which can be used to
+  reduce code size on the web if nothing else uses `BigInt` values.
+
+## 3.3.1
+
+- Avoid memory leaks when `tempDirectory` is set multiple times.
+- Update to SQLite 3.53.0 and SQLite3 Multiple Ciphers version 2.3.3.
+
+## 3.3.0
+
+- Web: Add `WasmModuleLoader` API to customize how WebAssembly modules are loaded.
+- Hook: Improve error message for failing downloads.
+
+## 3.2.0
+
+- Add `package:sqlite3/unstable/ffi_bindings.dart` providing low-level access to generated `libsqlite3` bindings.
+- Add `PreparedStatement.leak` to transfer ownership of a prepared statement into native code.
+- Add `Database.statementFromPointer`, which can be used to access a statement prepared in native code from Dart.
+
+## 3.1.7
+
+- Update to sqlite version 3.52.0.
+
+## 3.1.6
+
+- Expose the address of `sqlite3_close_v2` as static field on `Sqlite3` class.
+- Allow wrapping databases without closing them with the `borrowed` parameter
+  on `Sqlite3.fromPointer`.
+- Add `Database.leak()`, which extracts a `sqlite3*` pointer and disables
+  finalizers.
+
+## 3.1.5
+
+- Build hook: Ensure we use consistent filenames to fix issues on Apple platforms.
+
+## 3.1.4
+
+- Build hook: Fix paths not resolving on Windows when building from source.
+
+## 3.1.3
+
+- Update to SQLite version 3.51.2.
+
+## 3.1.2
+
+- `Database.select()` will now throw an exception if the SQL string contains
+  invalid text after the first statement.
+- Build hook: Support OS-specific names when using `source: system`.
+
+## 3.1.1
+
+- Hooks: Respect `HTTPS_PROXY` and related environment variables when
+  downloading SQLite (requires Dart 3.11 or later).
+- Update SQLite to version 3.51.1.
+
+## 3.1.0
+
+- Build hook: Allow using `name` key with `source: system` to load SQLite
+  libraries under a different name (e.g. `name: sqlcipher` to load SQLCipher).
+- Wasm: Fix an internal memory corruption issue when more than 16 Dart handles
+  are referenced from C.
+
+## 3.0.1
+
+- Build hook: Use clang from XCode when pre-compiling SQLite for iOS and macOS.
+
+## 3.0.0
+
+- __Breaking change__: Use [build hooks](https://dart.dev/tools/hooks) to load
+  SQLite instead of `DynamicLibrary`.
+  - The SQLite library can only be customized with user defines.
+  - You should drop your dependencies on `sqlite3_flutter_libs` and
+    `sqlcipher_flutter_libs` when upgrading.
+  - You can also remove dependencies on `sqlite3_native_assets`, since that
+    package is now part of `package:sqlite3`.
+- __Breaking change__: Parameters to `SqliteException`s are now named.
+- Deprecated `dispose()` on `CommonDatabase` and `CommonPreparedStatement`. Use `close()`
+  instead.
+- On native platforms, use native finalizers to reliably clear statements and databases.
+- On the web, use regular finalizers more consistently.
+- Refactor binding text and blob values to reduce the chance of memory leaks.
+- On the web, use `externref`s to call Dart functions from compiled WebAssembly sources.
+- Add `busyHandler` setter to install a custom `sqlite3_busy_handler` on databases.
+
 ## 2.9.4
 
 - `SimpleOpfsFileSystem`: Allow opening with `readwrite-unsafe`, which can be used to implement

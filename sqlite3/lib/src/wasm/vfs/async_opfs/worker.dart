@@ -4,7 +4,6 @@ library;
 
 import 'dart:js_interop';
 
-import 'package:path/path.dart' as p show url;
 import 'package:web/web.dart'
     show
         FileSystemDirectoryHandle,
@@ -13,12 +12,15 @@ import 'package:web/web.dart'
         FileSystemReadWriteOptions;
 
 import '../../../constants.dart';
+import '../../../platform/web.dart';
 import '../../../vfs.dart';
 import '../../js_interop.dart';
 import 'sync_channel.dart';
 
-const _workerDebugLog =
-    bool.fromEnvironment('sqlite3.wasm.worker.debug', defaultValue: false);
+const _workerDebugLog = bool.fromEnvironment(
+  'sqlite3.wasm.worker.debug',
+  defaultValue: false,
+);
 
 void _log(String message) {
   if (_workerDebugLog) print(message);
@@ -59,12 +61,12 @@ extension type WorkerOptions._raw(JSObject _) implements JSObject {
 }
 
 class _ResolvedPath {
-  final String fullPath;
+  final String debugPath;
 
   final FileSystemDirectoryHandle directory;
   final String filename;
 
-  _ResolvedPath(this.fullPath, this.directory, this.filename);
+  _ResolvedPath(this.debugPath, this.directory, this.filename);
 
   Future<FileSystemFileHandle> openFile({bool create = false}) {
     return directory.openFile(filename, create: create);
@@ -94,13 +96,12 @@ class VfsWorker {
   final Set<_OpenedFileHandle> _implicitlyHeldLocks = {};
 
   VfsWorker._(WorkerOptions options, this.root)
-      : synchronizer =
-            RequestResponseSynchronizer(options.synchronizationBuffer),
-        messages = MessageSerializer(options.communicationBuffer);
+    : synchronizer = RequestResponseSynchronizer(options.synchronizationBuffer),
+      messages = MessageSerializer(options.communicationBuffer);
 
   static Future<VfsWorker> create(WorkerOptions options) async {
     var root = await storageManager!.directory;
-    final split = p.url.split(options.root);
+    final split = pathComponents(options.root);
 
     for (final directory in split) {
       root = await root.getDirectory(directory, create: true);
@@ -109,18 +110,21 @@ class VfsWorker {
     return VfsWorker._(options, root);
   }
 
-  Future<_ResolvedPath> _resolvePath(String absolutePath,
-      {bool createDirectories = false}) async {
-    final fullPath = p.url.relative(absolutePath, from: '/');
-    final [...directories, file] = p.url.split(fullPath);
+  Future<_ResolvedPath> _resolvePath(
+    String absolutePath, {
+    bool createDirectories = false,
+  }) async {
+    final [...directories, file] = [...pathComponents(absolutePath)];
 
     var dirHandle = root;
     for (final entry in directories) {
-      dirHandle =
-          await dirHandle.getDirectory(entry, create: createDirectories);
+      dirHandle = await dirHandle.getDirectory(
+        entry,
+        create: createDirectories,
+      );
     }
 
-    return _ResolvedPath(fullPath, dirHandle, file);
+    return _ResolvedPath(absolutePath, dirHandle, file);
   }
 
   Future<Flags> _xAccess(NameAndInt32Flags flags) async {
@@ -164,7 +168,7 @@ class VfsWorker {
     final opened = _OpenedFileHandle(
       fd: _fdCounter++,
       directory: resolved.directory,
-      fullPath: resolved.fullPath,
+      debugPath: resolved.debugPath,
       filename: resolved.filename,
       file: fileHandle,
       deleteOnClose: (flags & SqlFlag.SQLITE_OPEN_DELETEONCLOSE) != 0,
@@ -189,8 +193,9 @@ class VfsWorker {
 
     final syncHandle = await _openForSynchronousAccess(file);
     final bytesRead = syncHandle.readDart(
-        messages.viewByteRange(0, bufferLength),
-        FileSystemReadWriteOptions(at: offset));
+      messages.viewByteRange(0, bufferLength),
+      FileSystemReadWriteOptions(at: offset),
+    );
 
     return Flags(bytesRead, 0, 0);
   }
@@ -203,8 +208,9 @@ class VfsWorker {
 
     final syncHandle = await _openForSynchronousAccess(file);
     final bytesWritten = syncHandle.writeDart(
-        messages.viewByteRange(0, bufferLength),
-        FileSystemReadWriteOptions(at: offset));
+      messages.viewByteRange(0, bufferLength),
+      FileSystemReadWriteOptions(at: offset),
+    );
 
     if (bytesWritten != bufferLength) {
       throw const VfsException(SqlExtendedError.SQLITE_IOERR_WRITE);
@@ -321,7 +327,8 @@ class VfsWorker {
           case WorkerOperation.xSleep:
             _releaseImplicitLocks();
             await Future<void>.delayed(
-                Duration(milliseconds: (request as Flags).flag0));
+              Duration(milliseconds: (request as Flags).flag0),
+            );
             response = const EmptyMessage();
             break;
           case WorkerOperation.xAccess:
@@ -391,7 +398,8 @@ class VfsWorker {
   }
 
   Future<FileSystemSyncAccessHandle> _openForSynchronousAccess(
-      _OpenedFileHandle file) async {
+    _OpenedFileHandle file,
+  ) async {
     final existing = file.syncHandle;
     if (existing != null) {
       return existing;
@@ -402,8 +410,9 @@ class VfsWorker {
 
     while (true) {
       try {
-        final handle =
-            file.syncHandle = await file.file.createSyncAccessHandle().toDart;
+        final handle = file.syncHandle = await file.file
+            .createSyncAccessHandle()
+            .toDart;
 
         // We've locked the file simply because we've created an (exclusive)
         // synchronous access handle. If there was no explicit lock on this
@@ -412,7 +421,7 @@ class VfsWorker {
         // across requests.
         if (!file.explicitlyLocked) {
           _implicitlyHeldLocks.add(file);
-          _log('Acquired implicit lock for ${file.fullPath}');
+          _log('Acquired implicit lock for ${file.debugPath}');
         }
         return handle;
       } catch (e) {
@@ -437,7 +446,7 @@ class VfsWorker {
   void _closeSyncHandle(_OpenedFileHandle handle) {
     final syncHandle = handle.syncHandle;
     if (syncHandle != null) {
-      _log('Closing sync handle for ${handle.fullPath}');
+      _log('Closing sync handle for ${handle.debugPath}');
       handle.syncHandle = null;
       _implicitlyHeldLocks.remove(handle);
       handle.explicitlyLocked = false;
@@ -451,7 +460,7 @@ class _OpenedFileHandle {
   final bool readonly;
   final bool deleteOnClose;
 
-  final String fullPath;
+  final String debugPath;
   final FileSystemDirectoryHandle directory;
   final String filename;
   final FileSystemFileHandle file;
@@ -463,7 +472,7 @@ class _OpenedFileHandle {
     required this.fd,
     required this.readonly,
     required this.deleteOnClose,
-    required this.fullPath,
+    required this.debugPath,
     required this.directory,
     required this.filename,
     required this.file,

@@ -1,3 +1,6 @@
+/// @docImport 'database.dart';
+library;
+
 import 'dart:typed_data';
 import 'package:sqlite3/common.dart';
 
@@ -23,8 +26,8 @@ enum FileType {
 ///  - [opfsShared]: Only available on Firefox, but very efficient.
 ///  - [opfsWithExternalLocks]: Only available on recent Chrome versions, also
 ///    quite efficient.
-///  - [opfsAtomics]: Only available when using COEP and COOP headers, but also
-///    reasonably efficient and supported across browsers.
+///  - [opfsWithExternalLocksWorkaround]: A design similar to
+///    [opfsWithExternalLocks] that also works in Firefox and Safari.
 ///  - [indexedDbShared]: A less efficient IndexedDB-based implementation used
 ///    as a fallback on older Chrome versions.
 ///
@@ -53,7 +56,9 @@ enum DatabaseImplementation {
   /// There is no concurrency control between these tabs, so this effectively
   /// does not support multiple tabs. It's mostly included for legacy reasons.
   indexedDbUnsafeWorker(
-      StorageMode.indexedDb, AccessMode.throughDedicatedWorker),
+    StorageMode.indexedDb,
+    AccessMode.throughDedicatedWorker,
+  ),
 
   /// Open an IndexedDB database in a shared worker.
   indexedDbShared(StorageMode.indexedDb, AccessMode.throughSharedWorker),
@@ -65,17 +70,18 @@ enum DatabaseImplementation {
   /// database concurrently.
   opfsWithExternalLocks(StorageMode.opfs, AccessMode.throughDedicatedWorker),
 
-  /// Open an asynchronous database stored in OPFS. It is "syncified" by using
-  /// a pair of two dedicated workers implementing an RPC channel over shared
-  /// memory and atomics.
-  opfsAtomics(StorageMode.opfs, AccessMode.throughDedicatedWorker),
+  /// A variant of [opfsWithExternalLocks] that works without the non-standard
+  /// `readwrite-unsafe` option (e.g. in Firefox and Safari).
+  opfsWithExternalLocksWorkaround(
+    StorageMode.opfs,
+    AccessMode.throughDedicatedWorker,
+  ),
 
   /// Open a synchronous database stored in OPFS.
   ///
   /// This works by letting a shared worker spawn a dedicated worker. This is
   /// supposed to work, but only implemented in Firefox.
-  opfsShared(StorageMode.opfs, AccessMode.throughSharedWorker),
-  ;
+  opfsShared(StorageMode.opfs, AccessMode.throughSharedWorker);
 
   final StorageMode storage;
   final AccessMode access;
@@ -197,10 +203,6 @@ enum MissingBrowserFeature {
   /// feature is only implemented by Firefox at the time of writing.
   dedicatedWorkersInSharedWorkers,
 
-  /// The browser doesn't allow dedicated workers to spawn their own dedicated
-  /// workers.
-  dedicatedWorkersCanNest,
-
   /// The browser does not support a synchronous version of the [File System API]
   ///
   /// [File System API]: https://developer.mozilla.org/en-US/docs/Web/API/File_System_Access_API
@@ -212,12 +214,6 @@ enum MissingBrowserFeature {
 
   /// The browser does not support IndexedDB.
   indexedDb,
-
-  /// The browser does not support shared array buffers and `Atomics.wait`.
-  ///
-  /// To enable this feature in most browsers, you need to serve your app with
-  /// two [special headers](https://web.dev/coop-coep/).
-  sharedArrayBuffers,
 }
 
 /// The result of [WebSqlite.runFeatureDetection], describing which browsers

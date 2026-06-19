@@ -9,8 +9,8 @@ import 'package:web/web.dart';
 
 import 'controller.dart';
 
-final sqlite3WasmUri = Uri.parse('sqlite3.wasm');
-final workerUri = Uri.parse('worker.dart.js');
+const sqlite3WasmUri = 'sqlite3.wasm';
+const workerUri = 'worker.dart.js';
 const databaseName = 'database';
 const additionalOptions = 'test-additional-options';
 
@@ -34,25 +34,34 @@ void main() {
   });
   _addCallbackForWebDriver('get_updates', (arg) async {
     listenForUpdates();
-    return [
-      updates.toJS,
-      commits.toJS,
-      rollbacks.toJS,
-    ].toJS;
+    return [updates.toJS, commits.toJS, rollbacks.toJS].toJS;
   });
   _addCallbackForWebDriver('open', (arg) => _open(arg, false));
   _addCallbackForWebDriver('open_only_vfs', (arg) => _open(arg, true));
+  _addCallbackForWebDriver('open_concurrent', (arg) async {
+    final sqlite = initializeSqlite();
+    final (a, b) = await (
+      sqlite.connectToRecommended('a'),
+      sqlite.connectToRecommended('b'),
+    ).wait;
+
+    await Future.wait([a.database.dispose(), b.database.dispose()]);
+    return null;
+  });
   _addCallbackForWebDriver('exec', _exec);
   _addCallbackForWebDriver('test_second', (arg) async {
     final sqlite = initializeSqlite();
     // Open one database to occupy the database id of zero in the worker
-    final unused =
-        await sqlite.connect('a', DatabaseImplementation.inMemoryShared);
+    final unused = await sqlite.connect(
+      'a',
+      DatabaseImplementation.inMemoryShared,
+    );
     await unused.execute('CREATE TABLE unused (bar TEXT);');
 
     // Then open another one
-    final first = await sqlite.connect(
-        'b', DatabaseImplementation.inMemoryShared) as RemoteDatabase;
+    final first =
+        await sqlite.connect('b', DatabaseImplementation.inMemoryShared)
+            as RemoteDatabase;
     await first.execute('CREATE TABLE foo (bar TEXT);');
 
     final endpoint = await first.additionalConnection();
@@ -105,8 +114,10 @@ void main() {
   });
   _addCallbackForWebDriver('delete_db', (arg) async {
     final storage = StorageMode.values.byName(arg!);
-    await initializeSqlite()
-        .deleteDatabase(name: databaseName, storage: storage);
+    await initializeSqlite().deleteDatabase(
+      name: databaseName,
+      storage: storage,
+    );
     return true.toJS;
   });
   _addCallbackForWebDriver('check_read_write', (arg) async {
@@ -142,7 +153,8 @@ void main() {
     final database = await sqlite.connectToRecommended(databaseName);
 
     print(
-        'selected storage: ${database.storage} through ${database.access} (${database.implementation})');
+      'selected storage: ${database.storage} through ${database.access} (${database.implementation})',
+    );
     print('missing features: ${database.features.missingFeatures}');
   });
 
@@ -150,7 +162,9 @@ void main() {
 }
 
 void _addCallbackForWebDriver(
-    String name, Future<JSAny?> Function(String?) impl) {
+  String name,
+  Future<JSAny?> Function(String?) impl,
+) {
   globalContext.setProperty(
     name.toJS,
     (JSString? arg, JSFunction callback) {
@@ -162,7 +176,10 @@ void _addCallbackForWebDriver(
         } catch (e, s) {
           final console = globalContext['console']! as JSObject;
           console.callMethod(
-              'error'.toJS, e.toString().toJS, s.toString().toJS);
+            'error'.toJS,
+            e.toString().toJS,
+            s.toString().toJS,
+          );
         }
 
         callback.callAsFunction(null, result);
@@ -173,7 +190,7 @@ void _addCallbackForWebDriver(
 
 WebSqlite initializeSqlite() {
   return webSqlite ??= WebSqlite.open(
-    worker: workerUri,
+    workers: WorkerConnector.defaultWorkers(workerUri),
     wasmModule: sqlite3WasmUri,
     controller: ExampleController(isInWorker: false),
     handleCustomRequest: (request) async {
@@ -219,8 +236,9 @@ Future<JSAny?> _open(String? implementationName, bool onlyOpenVfs) async {
 
   // Make sure it works!
   if (!onlyOpenVfs) {
-    final result = await db
-        .select('SELECT database_host() as host, additional_data() as data;');
+    final result = await db.select(
+      'SELECT database_host() as host, additional_data() as data;',
+    );
     final rows = result.result;
     if (rows.length != 1) {
       throw 'unexpected row count';

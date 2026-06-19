@@ -1,61 +1,38 @@
+import '../compile_options.dart';
 import '../constants.dart';
 import '../result_set.dart';
 import '../statement.dart';
 import 'bindings.dart';
 import 'database.dart';
 import 'exception.dart';
-import 'finalizer.dart';
 import 'utils.dart';
 
-final class FinalizableStatement extends FinalizablePart {
-  final RawSqliteStatement statement;
-
-  bool _inResetState = true;
-  bool _closed = false;
-
-  FinalizableStatement(this.statement);
-
-  @override
-  void dispose() {
-    if (!_closed) {
-      _closed = true;
-      _reset();
-      _deallocateArguments();
-      statement.sqlite3_finalize();
-    }
-  }
-
-  void _reset() {
-    if (!_inResetState) {
-      statement.sqlite3_reset();
-      _inResetState = true;
-    }
-  }
-
-  void _deallocateArguments() {
-    statement.deallocateArguments();
-  }
-}
-
 base class StatementImplementation extends CommonPreparedStatement {
+  // Note: Implementations of this have platform-specific finalizers on them.
   final RawSqliteStatement statement;
   final DatabaseImplementation database;
-  final FinalizableStatement finalizable;
+  bool isBorrowed;
 
   @override
   final String sql;
   List<Object?>? _latestArguments;
+  bool _inResetState = true;
+  bool _closed = false;
 
   _ActiveCursorIterator? _currentCursor;
 
-  StatementImplementation(this.sql, this.database, this.statement)
-      : finalizable = FinalizableStatement(statement);
+  StatementImplementation(
+    this.sql,
+    this.database,
+    this.statement, {
+    this.isBorrowed = false,
+  });
 
   List<String> get _columnNames {
     final columnCount = statement.sqlite3_column_count();
 
     return [
-      for (var i = 0; i < columnCount; i++) statement.sqlite3_column_name(i)
+      for (var i = 0; i < columnCount; i++) statement.sqlite3_column_name(i),
     ];
   }
 
@@ -69,7 +46,7 @@ base class StatementImplementation extends CommonPreparedStatement {
   }
 
   void _ensureNotFinalized() {
-    if (finalizable._closed) {
+    if (_closed || database.isClosed) {
       throw StateError('Tried to operate on a released prepared statement');
     }
   }
@@ -80,25 +57,19 @@ base class StatementImplementation extends CommonPreparedStatement {
 
     if (length != count) {
       throw ArgumentError.value(
-          parameters, 'parameters', 'Expected $count parameters, got $length');
+        parameters,
+        'parameters',
+        'Expected $count parameters, got $length',
+      );
     }
   }
 
   int _step() => statement.sqlite3_step();
 
-  void _reset({bool invalidateArgs = true}) {
-    finalizable._reset();
-    if (invalidateArgs) {
-      finalizable._deallocateArguments();
-    }
-
-    _currentCursor = null;
-  }
-
   void _execute() {
     int result;
 
-    finalizable._inResetState = false;
+    _inResetState = false;
     // Users should be able to execute statements returning rows, so we should
     // call _step() to skip past rows.
     do {
@@ -118,7 +89,7 @@ base class StatementImplementation extends CommonPreparedStatement {
 
   ResultSet _selectResults() {
     final rows = <List<Object?>>[];
-    finalizable._inResetState = false;
+    _inResetState = false;
 
     int columnCount = -1;
 
@@ -197,8 +168,11 @@ base class StatementImplementation extends CommonPreparedStatement {
 
     if (params.isEmpty) {
       if (expectedLength != 0) {
-        throw ArgumentError.value(params, 'params',
-            'Expected $expectedLength parameters, but none were set.');
+        throw ArgumentError.value(
+          params,
+          'params',
+          'Expected $expectedLength parameters, but none were set.',
+        );
       }
       return;
     }
@@ -210,8 +184,11 @@ base class StatementImplementation extends CommonPreparedStatement {
       // SQL parameters are 1-indexed, so 0 indicates that no parameter with
       // that name was found.
       if (i == 0) {
-        throw ArgumentError.value(params, 'params',
-            'This statement contains no parameter named `$key`');
+        throw ArgumentError.value(
+          params,
+          'params',
+          'This statement contains no parameter named `$key`',
+        );
       }
       _bindParam(param, i);
       paramsAsList[i - 1] = param;
@@ -221,7 +198,10 @@ base class StatementImplementation extends CommonPreparedStatement {
     // if the statement contains no additional parameters.
     if (expectedLength != params.length) {
       throw ArgumentError.value(
-          params, 'params', 'Expected $expectedLength parameters');
+        params,
+        'params',
+        'Expected $expectedLength parameters',
+      );
     }
 
     _latestArguments = paramsAsList;
@@ -231,12 +211,15 @@ base class StatementImplementation extends CommonPreparedStatement {
     final rc = switch (param) {
       null => statement.sqlite3_bind_null(i),
       int() => statement.sqlite3_bind_int64(i, param),
-      BigInt() => statement.sqlite3_bind_int64BigInt(i, param.checkRange),
+      BigInt() when supportDartBigInts => statement.sqlite3_bind_int64BigInt(
+        i,
+        param.checkRange,
+      ),
       bool() => statement.sqlite3_bind_int64(i, param ? 1 : 0),
       double() => statement.sqlite3_bind_double(i, param),
       String() => statement.sqlite3_bind_text(i, param),
       List<int>() => statement.sqlite3_bind_blob64(i, param),
-      _ => _bindCustomParam(param, i)
+      _ => _bindCustomParam(param, i),
     };
 
     if (rc != SqlError.SQLITE_OK) {
@@ -277,16 +260,26 @@ base class StatementImplementation extends CommonPreparedStatement {
 
   @override
   void reset() {
-    _reset(invalidateArgs: false);
+    if (!_inResetState) {
+      statement.sqlite3_reset();
+      _inResetState = true;
+    }
+
+    _currentCursor = null;
   }
 
   @override
   void dispose() {
-    if (!finalizable._closed) {
-      disposeFinalizer.detach(this);
-      finalizable.dispose();
+    close();
+  }
 
-      database.handleFinalized(this);
+  @override
+  void close() {
+    if (!_closed) {
+      _closed = true;
+      reset();
+
+      if (!isBorrowed) statement.sqlite3_finalize();
     }
   }
 
@@ -294,7 +287,7 @@ base class StatementImplementation extends CommonPreparedStatement {
   ResultSet selectWith(StatementParameters parameters) {
     _ensureNotFinalized();
 
-    _reset();
+    reset();
     _bindParams(parameters);
 
     return _selectResults();
@@ -304,7 +297,7 @@ base class StatementImplementation extends CommonPreparedStatement {
   void executeWith(StatementParameters parameters) {
     _ensureNotFinalized();
 
-    _reset();
+    reset();
     _bindParams(parameters);
     _execute();
   }
@@ -313,7 +306,7 @@ base class StatementImplementation extends CommonPreparedStatement {
   IteratingCursor iterateWith(StatementParameters parameters) {
     _ensureNotFinalized();
 
-    _reset();
+    reset();
     _bindParams(parameters);
 
     return _currentCursor = _ActiveCursorIterator(this);
@@ -332,7 +325,7 @@ base class StatementImplementation extends CommonPreparedStatement {
   ResultSet selectMap(Map<String, Object?> parameters) {
     _ensureNotFinalized();
 
-    _reset();
+    reset();
     _bindMapParams(parameters);
 
     return _selectResults();
@@ -355,15 +348,14 @@ class _ActiveCursorIterator extends IteratingCursor {
   /// This design issue is documented on [IteratingCursor].
   bool _hasReliableColumnNames = false;
 
-  _ActiveCursorIterator(
-    this.statement,
-  ) : super(statement._columnNames, statement._tableNames) {
-    statement.finalizable._inResetState = false;
+  _ActiveCursorIterator(this.statement)
+    : super(statement._columnNames, statement._tableNames) {
+    statement._inResetState = false;
   }
 
   @override
   bool moveNext() {
-    if (statement.finalizable._closed || statement._currentCursor != this) {
+    if (statement._closed || statement._currentCursor != this) {
       return false;
     }
 
@@ -378,7 +370,7 @@ class _ActiveCursorIterator extends IteratingCursor {
 
       assert(columnCount >= 0);
       final rowData = <Object?>[
-        for (var i = 0; i < columnCount; i++) statement._readValue(i)
+        for (var i = 0; i < columnCount; i++) statement._readValue(i),
       ];
 
       current = Row(this, rowData);

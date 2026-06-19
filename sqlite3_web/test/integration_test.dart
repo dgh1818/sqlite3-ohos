@@ -16,18 +16,14 @@ enum Browser {
   chrome(
     driverUriString: 'http://localhost:4444/wd/hub/',
     isChromium: true,
-    unsupportedImplementations: {
-      DatabaseImplementation.opfsShared,
-    },
+    unsupportedImplementations: {DatabaseImplementation.opfsShared},
     missingFeatures: {MissingBrowserFeature.dedicatedWorkersInSharedWorkers},
     defaultImplementation: DatabaseImplementation.opfsWithExternalLocks,
   ),
   firefox(
     driverUriString: 'http://localhost:4444/',
     defaultImplementation: DatabaseImplementation.opfsShared,
-    unsupportedImplementations: {
-      DatabaseImplementation.opfsWithExternalLocks,
-    },
+    unsupportedImplementations: {DatabaseImplementation.opfsWithExternalLocks},
     missingFeatures: {
       MissingBrowserFeature.createSyncAccessHandleReadWriteUnsafe,
     },
@@ -59,12 +55,14 @@ enum Browser {
   Future<Process> spawnDriver() async {
     return switch (this) {
       firefox => Process.start('geckodriver', []).then((result) async {
-          // geckodriver seems to take a while to initialize
-          await Future.delayed(const Duration(seconds: 1));
-          return result;
-        }),
-      chrome =>
-        Process.start('chromedriver', ['--port=4444', '--url-base=/wd/hub']),
+        // geckodriver seems to take a while to initialize
+        await Future.delayed(const Duration(seconds: 1));
+        return result;
+      }),
+      chrome => Process.start('chromedriver', [
+        '--port=4444',
+        '--url-base=/wd/hub',
+      ]),
     };
   }
 }
@@ -85,6 +83,12 @@ void main() {
 
       setUpAll(() async {
         final process = driverProcess = await browser.spawnDriver();
+
+        // On macOS, geckodriver seems to time out if there's no consumer on
+        // these.
+        process.stderr.listen((_) {});
+        process.stdout.listen((_) {});
+
         process.exitCode.then((code) {
           if (!isStoppingProcess) {
             throw 'Webdriver stopped (code $code) before tearing down tests.';
@@ -141,7 +145,7 @@ final class _TestConfiguration {
               ],
             },
             'moz:firefoxOptions': {
-              'args': ['-headless']
+              'args': ['-headless'],
             },
           },
         );
@@ -164,9 +168,9 @@ final class _TestConfiguration {
     }
 
     driver = TestWebDriver(server, rawDriver);
-    await driver.driver.get(isDart2Wasm
-        ? 'http://localhost:8080/?wasm=1'
-        : 'http://localhost:8080/');
+    await driver.driver.get(
+      isDart2Wasm ? 'http://localhost:8080/?wasm=1' : 'http://localhost:8080/',
+    );
     await driver.waitReady();
   }
 
@@ -189,6 +193,10 @@ final class _TestConfiguration {
     test('picks recommended option', () async {
       final implementation = await driver.openDatabase();
       expect(implementation, browser.defaultImplementation);
+    });
+
+    test('can open concurrently', () async {
+      await driver.openConcurrently();
     });
 
     for (final implementation in browser.availableImplementations) {
@@ -267,7 +275,8 @@ final class _TestConfiguration {
       // In 0.4.0, we've added a new OPFS implementation that would be used by
       // default on browsers that previously only supported IndexedDB.
       await driver.openDatabase(
-          implementation: DatabaseImplementation.indexedDbShared);
+        implementation: DatabaseImplementation.indexedDbShared,
+      );
       await driver.execute('CREATE TABLE foo (bar TEXT);');
       await driver.closeDatabase();
 

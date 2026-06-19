@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:js_interop';
 
 import 'package:meta/meta.dart';
@@ -7,6 +8,7 @@ import 'package:web/web.dart' hide FileSystem;
 import 'types.dart';
 import 'client.dart';
 import 'worker.dart';
+import 'worker_connector.dart';
 
 /// A controller responsible for opening databases in the worker.
 abstract base class DatabaseController {
@@ -14,9 +16,11 @@ abstract base class DatabaseController {
   const DatabaseController();
 
   /// Loads a wasm module from the given [uri] with the specified [headers].
-  Future<WasmSqlite3> loadWasmModule(Uri uri,
-      {Map<String, String>? headers}) async {
-    return WasmSqlite3.loadFromUrl(uri, headers: headers);
+  Future<WasmSqlite3> loadWasmModule(
+    String uri, {
+    Map<String, String>? headers,
+  }) async {
+    return WasmSqlite3.loadFromUrlString(uri, headers: headers);
   }
 
   /// Opens a database in the pre-configured [sqlite3] instance under the
@@ -29,13 +33,53 @@ abstract base class DatabaseController {
   /// might be useful to transport additional options relevant when opening the
   /// database.
   Future<WorkerDatabase> openDatabase(
-      WasmSqlite3 sqlite3, String path, String vfs, JSAny? additionalData);
+    WasmSqlite3 sqlite3,
+    String path,
+    String vfs,
+    JSAny? additionalData,
+  );
 
   /// Handles custom requests from clients that are not bound to a database.
   ///
   /// This is not currently used.
   Future<JSAny?> handleCustomRequest(
-      ClientConnection connection, JSAny? request);
+    ClientConnection connection,
+    CustomClientRequest request,
+  );
+}
+
+/// A custom request sent from a client to a worker hosting a database.
+final class CustomClientRequest {
+  /// The custom message sent from the client.
+  final JSAny? request;
+
+  /// A signal allowing clients to abort this request.
+  ///
+  /// Implementations can query this signal to throw an [AbortException] instead
+  /// of completing their work if that's more efficient. There is no guarantee
+  /// that aborting a signal actually cancels the pending task, though.
+  final AbortSignal abortSignal;
+
+  CustomClientRequest({required this.request, required this.abortSignal});
+}
+
+/// A [CustomClientRequest] sent to a worker-managed database
+final class CustomClientDatabaseRequest extends CustomClientRequest {
+  /// Runs a synchronous function with exclusive access to the underlying
+  /// database.
+  ///
+  /// This respects the lock token sent by [Database.customRequest], allowing
+  /// custom requests to integrate with the locking mechanism of
+  /// [Database.execute] and [Database.requestLock].
+  ///
+  /// Requesting a lock automatically respects an [abortSignal].
+  final Future<T> Function<T>(T Function() inner) useLock;
+
+  CustomClientDatabaseRequest({
+    required super.request,
+    required super.abortSignal,
+    required this.useLock,
+  });
 }
 
 /// An endpoint that can be used, by any running JavaScript context in the same
@@ -48,11 +92,7 @@ abstract base class DatabaseController {
 /// connect to the port already opened.
 typedef SqliteWebEndpoint = (MessagePort, String);
 
-typedef DatabaseResult<T> = ({
-  T result,
-  bool autocommit,
-  int lastInsertRowid,
-});
+typedef DatabaseResult<T> = ({T result, bool autocommit, int lastInsertRowid});
 
 /// Abstraction over a database either available locally or in a remote worker.
 abstract class Database {
@@ -88,6 +128,9 @@ abstract class Database {
   /// instance being explicitly [dispose]d. In those cases, monitoring [closed]
   /// is useful to react to databases closing.
   Future<void> get closed;
+
+  /// Whether the database is currently closed.
+  bool get isClosed;
 
   /// Closes this database and instructs the worker to release associated
   /// resources.
@@ -141,14 +184,20 @@ abstract class Database {
   /// The [abortTrigger] can be used to abort requesting the lock. When that
   /// future completes before the lock has been granted, the future may complete
   /// with a [AbortException] without ever invoking [body].
-  Future<T> requestLock<T>(Future<T> Function(LockToken lock) body,
-      {Future<void>? abortTrigger});
+  Future<T> requestLock<T>(
+    Future<T> Function(LockToken lock) body, {
+    Future<void>? abortTrigger,
+  });
 
   /// Sends a custom request to the worker database.
   ///
   /// Custom requests are handled by implementing `handleCustomRequest` in your
   /// `WorkerDatabase` subclass.
-  Future<JSAny?> customRequest(JSAny? request);
+  Future<JSAny?> customRequest(
+    JSAny? request, {
+    LockToken? token,
+    Future<void>? abortTrigger,
+  });
 
   /// Creates a [MessagePort] (a transferrable object that can be sent to
   /// another JavaScript context like a worker) that can be used with
@@ -195,7 +244,9 @@ abstract class WorkerDatabase {
   /// The response is sent over the channel and completes a
   /// [Database.customRequest] call for clients.
   Future<JSAny?> handleCustomRequest(
-      ClientConnection connection, JSAny? request);
+    ClientConnection connection,
+    CustomClientDatabaseRequest request,
+  );
 }
 
 /// The result of [WebSqlite.connectToRecommended], containing the opened
@@ -230,8 +281,10 @@ abstract class WebSqlite {
   /// Deletes a database from the [storage] if it exists.
   ///
   /// This method should not be called while the database is still open.
-  Future<void> deleteDatabase(
-      {required String name, required StorageMode storage});
+  Future<void> deleteDatabase({
+    required String name,
+    required StorageMode storage,
+  });
 
   /// Tries to find features related to storing and accessing databases.
   ///
@@ -256,8 +309,12 @@ abstract class WebSqlite {
   /// The optional [additionalOptions] must be sendable over message ports and
   /// is passed to [DatabaseController.openDatabase] on the worker opening the
   /// database.
-  Future<Database> connect(String name, DatabaseImplementation implementation,
-      {bool onlyOpenVfs = false, JSAny? additionalOptions});
+  Future<Database> connect(
+    String name,
+    DatabaseImplementation implementation, {
+    bool onlyOpenVfs = false,
+    JSAny? additionalOptions,
+  });
 
   /// Starts a feature detection via [runFeatureDetection] and then [connect]s
   /// to the best database available.
@@ -272,18 +329,28 @@ abstract class WebSqlite {
   /// The optional [additionalOptions] must be sendable over message ports and
   /// is passed to [DatabaseController.openDatabase] on the worker opening the
   /// database.
-  Future<ConnectToRecommendedResult> connectToRecommended(String name,
-      {bool onlyOpenVfs = false, JSAny? additionalOptions});
+  Future<ConnectToRecommendedResult> connectToRecommended(
+    String name, {
+    bool onlyOpenVfs = false,
+    JSAny? additionalOptions,
+  });
 
-  /// Entrypoints for workers hosting datbases.
+  /// Closes this instance and associated dedicated workers.
+  void close();
+
+  /// Entrypoints for workers hosting databases.
   static void workerEntrypoint({
     required DatabaseController controller,
+    WorkerEnvironment? environment,
   }) {
-    WorkerRunner(controller).handleRequests();
+    WorkerRunner(
+      controller,
+      environment ?? WorkerEnvironment(),
+    ).handleRequests();
   }
 
-  /// Opens a [WebSqlite] instance by connecting to the given [worker] and
-  /// using the [wasmModule] url to load sqlite3.
+  /// Opens a [WebSqlite] instance by connecting to workers with the given
+  /// [workers] connector and using the [wasmModule] url to load sqlite3.
   ///
   /// The [controller] is used when connecting to a sqlite3 database without
   /// using workers. It should typically be the same implementation as the one
@@ -293,13 +360,13 @@ abstract class WebSqlite {
   /// sends a custom request to the client (via [ClientConnection.customRequest]).
   /// If it's absent, the default is to throw an exception when called.
   static WebSqlite open({
-    required Uri worker,
-    required Uri wasmModule,
+    required WorkerConnector workers,
+    required String wasmModule,
     DatabaseController? controller,
     Future<JSAny?> Function(JSAny?)? handleCustomRequest,
   }) {
     return DatabaseClient(
-      worker,
+      workers,
       wasmModule,
       controller ?? const _DefaultDatabaseController(),
       handleCustomRequest,
@@ -325,8 +392,12 @@ abstract class WebSqlite {
     SqliteWebEndpoint endpoint, {
     Future<JSAny?> Function(JSAny?)? handleCustomRequest,
   }) {
-    final client = DatabaseClient(Uri.base, Uri.base,
-        const _DefaultDatabaseController(), handleCustomRequest);
+    final client = DatabaseClient(
+      const WorkerConnector.unsupported(),
+      (globalContext as Window).location.href,
+      const _DefaultDatabaseController(),
+      handleCustomRequest,
+    );
     return client.connectToExisting(endpoint);
   }
 }
@@ -336,13 +407,19 @@ final class _DefaultDatabaseController extends DatabaseController {
 
   @override
   Future<JSAny?> handleCustomRequest(
-      ClientConnection connection, JSAny? request) {
+    ClientConnection connection,
+    CustomClientRequest request,
+  ) {
     throw UnimplementedError();
   }
 
   @override
-  Future<WorkerDatabase> openDatabase(WasmSqlite3 sqlite3, String path,
-      String vfs, JSAny? additionalOptions) async {
+  Future<WorkerDatabase> openDatabase(
+    WasmSqlite3 sqlite3,
+    String path,
+    String vfs,
+    JSAny? additionalOptions,
+  ) async {
     return _DefaultWorkerDatabase(sqlite3.open(path, vfs: vfs));
   }
 }
@@ -355,7 +432,9 @@ final class _DefaultWorkerDatabase extends WorkerDatabase {
 
   @override
   Future<JSAny?> handleCustomRequest(
-      ClientConnection connection, JSAny? request) {
+    ClientConnection connection,
+    CustomClientRequest request,
+  ) {
     throw UnimplementedError();
   }
 }

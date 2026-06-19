@@ -3,133 +3,39 @@ import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
 import 'dart:typed_data';
 import 'package:sqlite3/wasm.dart';
-import 'package:stream_channel/stream_channel.dart';
 import 'package:web/web.dart'
     show
+        AbortController,
         AbortSignal,
         DedicatedWorkerGlobalScope,
         EventStreamProviders,
         FileSystemDirectoryHandle,
         FileSystemFileHandle,
         FileSystemSyncAccessHandle,
-        MessageEvent,
-        MessagePort,
-        SharedWorkerGlobalScope,
-        Worker,
-        AbortController;
+        URL;
 // ignore: implementation_imports
 import 'package:sqlite3/src/wasm/js_interop/new_file_system_access.dart';
 
 import 'database.dart';
 import 'channel.dart';
+import 'external_locks_vfs.dart';
 import 'locks.dart';
 import 'protocol.dart';
 import 'shared.dart';
 import 'types.dart';
+import 'worker_connector.dart';
 
-sealed class WorkerEnvironment {
-  WorkerEnvironment._();
-
-  factory WorkerEnvironment() {
-    final context = globalContext;
-    if (context.instanceOfString('DedicatedWorkerGlobalScope')) {
-      return Dedicated();
-    } else {
-      return Shared();
-    }
-  }
-
+extension on WorkerEnvironment {
   /// Messages outside of a connection being posted to the worker or a connect
   /// port of a shared worker.
   ///
   /// We're not using them for actual channels, but instead have clients
   /// setup message ports which are then forwarded to workers using these
   /// top-level requests.
-  Stream<Message> get topLevelRequests;
-}
-
-final class Dedicated extends WorkerEnvironment {
-  final DedicatedWorkerGlobalScope scope;
-
-  Dedicated()
-      : scope = globalContext as DedicatedWorkerGlobalScope,
-        super._();
-
-  @override
   Stream<Message> get topLevelRequests {
-    return EventStreamProviders.messageEvent.forTarget(scope).map((event) {
-      return Message.deserialize(event.data as JSObject);
+    return incomingMessages.map((event) {
+      return event.data as Message;
     });
-  }
-}
-
-final class Shared extends WorkerEnvironment {
-  final SharedWorkerGlobalScope scope;
-
-  Shared()
-      : scope = globalContext as SharedWorkerGlobalScope,
-        super._();
-
-  @override
-  Stream<Message> get topLevelRequests {
-    // Listen for connect events, then watch each connected port to send a a
-    // connect message.
-    // Tabs will only use one message port to this worker, but may use multiple
-    // connections for different databases. So we're not using the connect port
-    // for the actual connection and instead wait for clients to send message
-    // ports through the connect port.
-    return Stream.multi((listener) {
-      final connectPorts = <MessagePort>[];
-      final subscriptions = <StreamSubscription>[];
-
-      void handlePort(MessagePort port) {
-        connectPorts.add(port);
-        port.start();
-
-        subscriptions.add(
-            EventStreamProviders.messageEvent.forTarget(port).listen((event) {
-          listener.addSync(Message.deserialize(event.data as JSObject));
-        }));
-      }
-
-      subscriptions.add(
-          EventStreamProviders.connectEvent.forTarget(scope).listen((event) {
-        for (final port in (event as MessageEvent).ports.toDart) {
-          handlePort(port);
-        }
-      }));
-
-      listener.onCancel = () {
-        for (final subscription in subscriptions) {
-          subscription.cancel();
-        }
-      };
-    });
-  }
-}
-
-/// A fake worker environment running in the same context as the main
-/// application.
-///
-/// This allows using a communication channel based on message ports regardless
-/// of where the database is hosted. While that adds overhead, a local
-/// environment is only used as a fallback if workers are unavailable.
-final class Local extends WorkerEnvironment {
-  final StreamController<Message> _messages = StreamController();
-
-  Local() : super._();
-
-  void addTopLevelMessage(Message message) {
-    _messages.add(message);
-  }
-
-  void close() {
-    _messages.close();
-  }
-
-  @override
-  Stream<Message> get topLevelRequests {
-    return _messages.stream;
   }
 }
 
@@ -185,7 +91,10 @@ final class _ConnectionDatabase {
   }
 
   Future<T> useLock<T>(
-      int? lockId, AbortSignal abortSignal, T Function() block) {
+    int? lockId,
+    AbortSignal abortSignal,
+    T Function() block,
+  ) {
     if (lockId == null) {
       // Not in an explicit lock context, just use global database lock.
       if (!database.locks.canRunSynchronousBlockDirectly) {
@@ -208,21 +117,23 @@ final class _ConnectionDatabase {
     final started = _startAbortableOperation(abortSignal);
     final resolvedLockId = Completer<int>();
 
-    database.locks.lock(() {
-      // Since we just obtained an exclusive lock, we cannot possibly be holding
-      // the lock already.
-      assert(_heldLock == null);
+    database.locks
+        .lock(() {
+          // Since we just obtained an exclusive lock, we cannot possibly be holding
+          // the lock already.
+          assert(_heldLock == null);
 
-      final id = _nextLockId++;
-      final completer = Completer<void>();
-      _heldLock = (id, completer);
-      resolvedLockId.complete(id);
-      return completer.future;
-    }, started.signal).onError<Object>((e, s) {
-      if (!resolvedLockId.isCompleted) {
-        resolvedLockId.completeError(e, s);
-      }
-    });
+          final id = _nextLockId++;
+          final completer = Completer<void>();
+          _heldLock = (id, completer);
+          resolvedLockId.complete(id);
+          return completer.future;
+        }, started.signal)
+        .onError<Object>((e, s) {
+          if (!resolvedLockId.isCompleted) {
+            resolvedLockId.completeError(e, s);
+          }
+        });
 
     return resolvedLockId.future.whenComplete(() {
       _removeAbortableOperation(started);
@@ -247,12 +158,12 @@ final class _ClientConnection extends ProtocolChannel
   @override
   final int id;
 
-  _ClientConnection(
-      {required WorkerRunner runner,
-      required StreamChannel<Message> channel,
-      required this.id})
-      : _runner = runner,
-        super(channel) {
+  _ClientConnection({
+    required WorkerRunner runner,
+    required ConnectableChannel channel,
+    required this.id,
+  }) : _runner = runner,
+       super(channel) {
     closed.whenComplete(() async {
       for (final id in _openedDatabases) {
         await id.close();
@@ -261,73 +172,137 @@ final class _ClientConnection extends ProtocolChannel
     });
   }
 
-  @override
-  Future<Response> handleCompatibilityCheck(
-      CompatibilityCheck request, AbortSignal abortSignal) async {
-    return SimpleSuccessResponse(
+  Future<Response> _handleCompatibilityCheck(
+    CompatibilityCheck request,
+    AbortSignal abortSignal,
+  ) async {
+    return newSimpleSuccessResponse(
       response: (await _runner.checkCompatibility(request)).toJS,
       requestId: request.requestId,
     );
   }
 
   @override
-  Future<Response> handleConnect(
-      ConnectRequest request, AbortSignal abortSignal) async {
-    final inner = _runner.useOrSpawnInnerWorker();
-    ConnectRequest(endpoint: request.endpoint, requestId: 0)
-        .sendToWorker(inner);
+  FutureOr<Response> handleDedicatedCompatibilityCheck(
+    DedicatedCompatibilityCheck request,
+    AbortSignal abortSignal,
+  ) {
+    return _handleCompatibilityCheck(request, abortSignal);
+  }
 
-    return SimpleSuccessResponse(response: null, requestId: request.requestId);
+  @override
+  FutureOr<Response> handleDedicatedInSharedCompatibilityCheck(
+    DedicatedInSharedCompatibilityCheck request,
+    AbortSignal abortSignal,
+  ) {
+    return _handleCompatibilityCheck(request, abortSignal);
+  }
+
+  @override
+  FutureOr<Response> handleSharedCompatibilityCheck(
+    SharedCompatibilityCheck request,
+    AbortSignal abortSignal,
+  ) {
+    return _handleCompatibilityCheck(request, abortSignal);
+  }
+
+  @override
+  Future<Response> handleConnect(
+    ConnectRequest request,
+    AbortSignal abortSignal,
+  ) async {
+    // This is only used to let clients connect to a dedicated worker hosted in
+    // this shared worker.
+    final inner = _runner._innerWorker!;
+    newConnectRequest(
+      endpoint: request.endpoint,
+      requestId: 0,
+      databaseId: null,
+    ).sendToWorker(inner);
+
+    return newSimpleSuccessResponse(
+      response: null,
+      requestId: request.requestId,
+    );
   }
 
   @override
   Future<Response> handleCustom(
-      CustomRequest request, AbortSignal abortSignal) async {
+    CustomRequest request,
+    AbortSignal abortSignal,
+  ) async {
     JSAny? response;
 
     if (request.databaseId case final id?) {
-      response = await (await _databaseById(id).database.opened)
-          .handleCustomRequest(this, request.payload);
+      final database = _databaseById(id);
+      final lockId = request.lockId;
+      final wrapped = CustomClientDatabaseRequest(
+        request: request.payload,
+        abortSignal: abortSignal,
+        useLock: <T>(block) {
+          return database.useLock(lockId, abortSignal, block);
+        },
+      );
+
+      response = await (await database.database.opened).handleCustomRequest(
+        this,
+        wrapped,
+      );
     } else {
-      response =
-          await _runner._controller.handleCustomRequest(this, request.payload);
+      response = await _runner._controller.handleCustomRequest(
+        this,
+        CustomClientRequest(request: request, abortSignal: abortSignal),
+      );
     }
 
-    return SimpleSuccessResponse(
-        requestId: request.requestId, response: response);
+    return newSimpleSuccessResponse(
+      requestId: request.requestId,
+      response: response,
+    );
   }
 
   @override
   Future<Response> handleOpen(
-      OpenRequest request, AbortSignal abortSignal) async {
-    await _runner.loadWasmModule(request.wasmUri);
-    DatabaseState? database;
-    _ConnectionDatabase? connectionDatabase;
+    OpenRequest request,
+    AbortSignal abortSignal,
+  ) async {
+    return await _runner.openLock.withCriticalSection(() async {
+      await _runner.loadWasmModule(request.wasmUri);
+      DatabaseState? database;
+      _ConnectionDatabase? connectionDatabase;
 
-    try {
-      database = _runner.findDatabase(
-          request.databaseName, request.storageMode, request.additionalData);
+      try {
+        database = _runner.findDatabase(
+          request.databaseName,
+          FileSystemImplementation.fromJS(request.storageMode),
+          request.additionalData,
+        );
 
-      await (request.onlyOpenVfs ? database.vfs : database.opened);
+        await (request.onlyOpenVfs ? database.vfs : database.opened);
 
-      connectionDatabase = _ConnectionDatabase(database);
-      _openedDatabases.add(connectionDatabase);
+        connectionDatabase = _ConnectionDatabase(database);
+        _openedDatabases.add(connectionDatabase);
 
-      return SimpleSuccessResponse(
-          response: database.id.toJS, requestId: request.requestId);
-    } catch (e) {
-      if (database != null) {
-        _openedDatabases.remove(connectionDatabase);
-        await database.decrementRefCount();
+        return newSimpleSuccessResponse(
+          response: database.id.toJS,
+          requestId: request.requestId,
+        );
+      } catch (e) {
+        if (database != null) {
+          _openedDatabases.remove(connectionDatabase);
+          await database.decrementRefCount();
+        }
+
+        rethrow;
       }
-
-      rethrow;
-    }
+    });
   }
 
   @override
   Future<Response> handleRunQuery(
-      RunQuery request, AbortSignal abortSignal) async {
+    RunQuery request,
+    AbortSignal abortSignal,
+  ) async {
     final database = _requireDatabase(request);
     final openedDatabase = await database.database.opened;
 
@@ -338,91 +313,141 @@ final class _ClientConnection extends ProtocolChannel
         throw StateError('Database is not in a transaction');
       }
 
+      final parameters = TypeCode.decodeValues(
+        request.parameters,
+        request.typeVector,
+      );
+
       ResultSet? resultSet;
       if (request.returnRows) {
-        resultSet = db.select(request.sql, request.parameters);
-      } else {
-        db.execute(request.sql, request.parameters);
-      }
+        resultSet = db.select(request.sql, parameters);
 
-      return RowsResponse(
-        resultSet: resultSet,
-        requestId: request.requestId,
-        autocommit: db.autocommit,
-        lastInsertRowId: db.lastInsertRowId,
-      );
+        return RowsResponseUtils.wrapResultSet(
+          request.requestId,
+          resultSet: resultSet,
+          autoCommit: db.autocommit,
+          lastInsertRowId: db.lastInsertRowId,
+        );
+      } else {
+        db.execute(request.sql, parameters);
+
+        return newRowsResponse(
+          columnNames: null,
+          tableNames: null,
+          typeVector: null,
+          rows: null,
+          autoCommit: db.autocommit,
+          lastInsertRowId: db.lastInsertRowId,
+          requestId: request.requestId,
+        );
+      }
     });
   }
 
   @override
   Future<Response> handleExclusiveLock(
-      RequestExclusiveLock request, AbortSignal abortSignal) async {
+    RequestExclusiveLock request,
+    AbortSignal abortSignal,
+  ) async {
     final database = _requireDatabase(request);
     final lock = await database.obtainLockAsync(abortSignal);
-    return SimpleSuccessResponse(
-        response: lock.toJS, requestId: request.requestId);
+    return newSimpleSuccessResponse(
+      response: lock.toJS,
+      requestId: request.requestId,
+    );
   }
 
   @override
   Response handleReleaseLock(ReleaseLock request, AbortSignal abortSignal) {
     final database = _requireDatabase(request);
     database.releaseLock(request.lockId);
-    return SimpleSuccessResponse(response: null, requestId: request.requestId);
+    return newSimpleSuccessResponse(
+      response: null,
+      requestId: request.requestId,
+    );
   }
 
   @override
-  Future<Response> handleStream(
-      StreamRequest request, AbortSignal abortSignal) async {
+  FutureOr<Response> handleCommitRequest(
+    CommitsStreamRequest request,
+    AbortSignal abortSignal,
+  ) async {
     final database = _requireDatabase(request);
-
     if (request.action) {
-      // Subscribe.
-      switch (request.type) {
-        case MessageType.updateRequest:
-          return await subscribe(database.updates, () async {
-            final rawDatabase = await database.database.opened;
-            return rawDatabase.database.updates.listen((event) {
-              sendNotification(
-                  UpdateNotification(update: event, databaseId: database.id));
-            });
-          }, request);
-        case MessageType.commitRequest:
-          return await subscribe(database.commits, () async {
-            final rawDatabase = await database.database.opened;
-            return rawDatabase.database.commits.listen((event) {
-              sendNotification(EmptyNotification(
-                  type: MessageType.notifyCommit, databaseId: database.id));
-            });
-          }, request);
-        case MessageType.rollbackRequest:
-          return await subscribe(database.rollbacks, () async {
-            final rawDatabase = await database.database.opened;
-            return rawDatabase.database.rollbacks.listen((event) {
-              sendNotification(EmptyNotification(
-                  type: MessageType.notifyRollback, databaseId: database.id));
-            });
-          }, request);
-        default:
-          throw ArgumentError('Unknown stream to subscribe to');
-      }
+      return await subscribe(database.commits, () async {
+        final rawDatabase = await database.database.opened;
+        return rawDatabase.database.commits.listen((event) {
+          sendNotification(newCommitNotification(databaseId: database.id));
+        });
+      }, request);
     } else {
-      // Unsubscribe.
-      final handler = switch (request.type) {
-        MessageType.updateRequest => database.updates,
-        MessageType.rollbackRequest => database.rollbacks,
-        MessageType.commitRequest => database.commits,
-        _ => throw ArgumentError('Unknown stream to unsubscribe from'),
-      };
-      handler.cancel();
+      database.commits.cancel();
 
-      return SimpleSuccessResponse(
-          response: null, requestId: request.requestId);
+      return newSimpleSuccessResponse(
+        response: null,
+        requestId: request.requestId,
+      );
+    }
+  }
+
+  @override
+  FutureOr<Response> handleRollbackRequest(
+    RollbackStreamRequest request,
+    AbortSignal abortSignal,
+  ) async {
+    final database = _requireDatabase(request);
+    if (request.action) {
+      return await subscribe(database.rollbacks, () async {
+        final rawDatabase = await database.database.opened;
+        return rawDatabase.database.rollbacks.listen((event) {
+          sendNotification(newRollbackNotification(databaseId: database.id));
+        });
+      }, request);
+    } else {
+      database.rollbacks.cancel();
+
+      return newSimpleSuccessResponse(
+        response: null,
+        requestId: request.requestId,
+      );
+    }
+  }
+
+  @override
+  FutureOr<Response> handleUpdateRequest(
+    UpdateStreamRequest request,
+    AbortSignal abortSignal,
+  ) async {
+    final database = _requireDatabase(request);
+    if (request.action) {
+      return await subscribe(database.updates, () async {
+        final rawDatabase = await database.database.opened;
+        return rawDatabase.database.updates.listen((event) {
+          sendNotification(
+            newUpdateNotification(
+              updateKind: event.kind.index,
+              rowId: event.rowId,
+              updateTableName: event.tableName,
+              databaseId: database.id,
+            ),
+          );
+        });
+      }, request);
+    } else {
+      database.updates.cancel();
+
+      return newSimpleSuccessResponse(
+        response: null,
+        requestId: request.requestId,
+      );
     }
   }
 
   @override
   Future<Response> handleOpenAdditionalConnection(
-      OpenAdditonalConnection request, AbortSignal abortSignal) async {
+    OpenAdditionalConnection request,
+    AbortSignal abortSignal,
+  ) async {
     final database = _requireDatabase(request).database;
     database.refCount++;
     final (endpoint, channel) = await createChannel();
@@ -430,70 +455,100 @@ final class _ClientConnection extends ProtocolChannel
     final client = _runner._accept(channel);
     client._openedDatabases.add(_ConnectionDatabase(database, 0));
 
-    return EndpointResponse(requestId: request.requestId, endpoint: endpoint);
+    return newEndpointResponse(
+      requestId: request.requestId,
+      endpoint: endpoint,
+    );
   }
 
   @override
   Future<Response> handleCloseDatabase(
-      CloseDatabase request, AbortSignal abortSignal) async {
+    CloseDatabase request,
+    AbortSignal abortSignal,
+  ) async {
     final database = _requireDatabase(request);
     _openedDatabases.remove(database);
     await database.close();
-    return SimpleSuccessResponse(response: null, requestId: request.requestId);
+    return newSimpleSuccessResponse(
+      response: null,
+      requestId: request.requestId,
+    );
   }
 
   @override
   Future<Response> handleFileSystemFlush(
-      FileSystemFlushRequest request, AbortSignal abortSignal) async {
+    FileSystemFlushRequest request,
+    AbortSignal abortSignal,
+  ) async {
     if (await _requireDatabase(request).database.vfs
         case IndexedDbFileSystem idb) {
       await idb.flush();
     }
 
-    return SimpleSuccessResponse(response: null, requestId: request.requestId);
+    return newSimpleSuccessResponse(
+      response: null,
+      requestId: request.requestId,
+    );
   }
 
   @override
   Future<Response> handleFileSystemAccess(
-      FileSystemAccess request, AbortSignal abortSignal) async {
+    FileSystemAccess request,
+    AbortSignal abortSignal,
+  ) async {
     final database = _requireDatabase(request);
-    final fsType = request.fsType;
+    final fsType = FileType.values[request.fsType];
     final buffer = request.buffer;
 
     final vfs = await database.database.vfs;
-    final file = vfs
-        .xOpen(Sqlite3Filename(fsType.pathInVfs), SqlFlag.SQLITE_OPEN_CREATE)
-        .file;
+    return await database.useLock(null, abortSignal, () {
+      final file = vfs
+          .xOpen(Sqlite3Filename(fsType.pathInVfs), SqlFlag.SQLITE_OPEN_CREATE)
+          .file;
 
-    try {
-      if (buffer != null) {
-        final asDartBuffer = buffer.toDart;
-        file.xTruncate(asDartBuffer.lengthInBytes);
-        file.xWrite(asDartBuffer.asUint8List(), 0);
+      try {
+        if (buffer != null) {
+          final asDartBuffer = buffer.toDart;
+          file.xTruncate(asDartBuffer.lengthInBytes);
+          file.xWrite(asDartBuffer.asUint8List(), 0);
 
-        return SimpleSuccessResponse(
-            response: null, requestId: request.requestId);
-      } else {
-        final buffer = Uint8List(file.xFileSize());
-        file.xRead(buffer, 0);
+          return newSimpleSuccessResponse(
+            response: null,
+            requestId: request.requestId,
+          );
+        } else {
+          final buffer = Uint8List(file.xFileSize());
+          file.xRead(buffer, 0);
 
-        return SimpleSuccessResponse(
-            response: buffer.buffer.toJS, requestId: request.requestId);
+          return newSimpleSuccessResponse(
+            response: buffer.buffer.toJS,
+            requestId: request.requestId,
+          );
+        }
+      } finally {
+        file.xClose();
       }
-    } finally {
-      file.xClose();
-    }
+    });
   }
 
   @override
   FutureOr<Response> handleFileSystemExists(
-      FileSystemExistsQuery request, AbortSignal abortSignal) async {
+    FileSystemExistsQuery request,
+    AbortSignal abortSignal,
+  ) async {
     final database = _requireDatabase(request);
     final vfs = await database.database.vfs;
-    final exists = vfs.xAccess(request.fsType.pathInVfs, 0) == 1;
 
-    return SimpleSuccessResponse(
-        response: exists.toJS, requestId: request.requestId);
+    final exists = await database.useLock(
+      null,
+      abortSignal,
+      () => vfs.xAccess(FileType.values[request.fsType].pathInVfs, 0) == 1,
+    );
+
+    return newSimpleSuccessResponse(
+      response: exists.toJS,
+      requestId: request.requestId,
+    );
   }
 
   Future<Response> subscribe(
@@ -502,7 +557,10 @@ final class _ClientConnection extends ProtocolChannel
     StreamRequest request,
   ) async {
     state.subscription ??= await subscribeInternally();
-    return SimpleSuccessResponse(response: null, requestId: request.requestId);
+    return newSimpleSuccessResponse(
+      response: null,
+      requestId: request.requestId,
+    );
   }
 
   @override
@@ -513,8 +571,14 @@ final class _ClientConnection extends ProtocolChannel
   @override
   Future<JSAny?> customRequest(JSAny? request) async {
     final response = await sendRequest(
-        CustomRequest(requestId: 0, payload: request),
-        MessageType.simpleSuccessResponse);
+      newCustomRequest(
+        requestId: 0,
+        payload: request,
+        databaseId: null,
+        lockId: null,
+      ),
+      MessageType.simpleSuccessResponse,
+    );
     return response.response;
   }
 
@@ -533,9 +597,9 @@ final class _ClientConnection extends ProtocolChannel
 
 extension on FileType {
   String get pathInVfs => switch (this) {
-        FileType.database => '/database',
-        FileType.journal => '/database-journal',
-      };
+    FileType.database => '/database',
+    FileType.journal => '/database-journal',
+  };
 }
 
 final class DatabaseState {
@@ -568,31 +632,29 @@ final class DatabaseState {
   Future<VirtualFileSystem> get vfs async {
     await (_openVfs ??= Future.sync(() async {
       switch (mode) {
-        case FileSystemImplementation.opfsAtomics:
-          final options = WasmVfs.createOptions(root: pathForOpfs(name));
-          final worker = Worker(Uri.base.toString().toJS);
-
-          StartFileSystemServer(options: options).sendToWorker(worker);
-
-          // Wait for the server worker to report that it's ready
-          await EventStreamProviders.messageEvent.forTarget(worker).first;
-
-          final wasmVfs =
-              _resolvedVfs = WasmVfs(workerOptions: options, vfsName: vfsName);
-          closeHandler = wasmVfs.close;
         case FileSystemImplementation.opfsShared:
           final simple = _resolvedVfs =
-              await SimpleOpfsFileSystem.loadFromStorage(pathForOpfs(name),
-                  vfsName: vfsName);
+              await SimpleOpfsFileSystem.loadFromStorage(
+                pathForOpfs(name),
+                vfsName: vfsName,
+              );
           closeHandler = simple.close;
         case FileSystemImplementation.opfsExternalLocks:
-          final simple = _resolvedVfs =
-              await SimpleOpfsFileSystem.loadFromStorage(pathForOpfs(name),
-                  vfsName: vfsName, readWriteUnsafe: true);
-          closeHandler = simple.close;
+        case FileSystemImplementation.opfsExternalLocksWorkaround:
+          final state = await ExternalLocksState.open(
+            path: pathForOpfs(name),
+            vfsName: vfsName,
+            readWriteUnsafe: mode == .opfsExternalLocks,
+          );
+          locks.attachVfs(state);
+
+          final vfs = _resolvedVfs = state.fs;
+          closeHandler = vfs.close;
         case FileSystemImplementation.indexedDb:
-          final idb = _resolvedVfs =
-              await IndexedDbFileSystem.open(dbName: name, vfsName: vfsName);
+          final idb = _resolvedVfs = await IndexedDbFileSystem.open(
+            dbName: name,
+            vfsName: vfsName,
+          );
           closeHandler = idb.close;
         case FileSystemImplementation.inMemory:
           _resolvedVfs = InMemoryFileSystem(name: vfsName);
@@ -617,7 +679,8 @@ final class DatabaseState {
           // We still provide support for multiple databases by keeping multiple
           // VFS instances around.
           '/database',
-          vfsName, additionalOptions,
+          vfsName,
+          additionalOptions,
         );
       }, null);
     });
@@ -633,14 +696,17 @@ final class DatabaseState {
 
   Future<void> close() async {
     final sqlite3 = await runner._sqlite3!;
-    final database = await _database!;
+    if (_database case final dbFuture?) {
+      final database = await dbFuture;
+      database.database.close();
 
-    database.database.dispose();
-    if (_resolvedVfs case final vfs?) {
-      sqlite3.unregisterVirtualFileSystem(vfs);
+      if (_resolvedVfs case final vfs?) {
+        sqlite3.unregisterVirtualFileSystem(vfs);
+      }
     }
 
     await closeHandler?.call();
+    unawaited(locks.releaseNavigatorLocks());
   }
 }
 
@@ -655,44 +721,50 @@ final class WorkerRunner {
   var _nextDatabaseId = 0;
 
   Future<WasmSqlite3>? _sqlite3;
-  Uri? _wasmUri;
+  String? _wasmUri;
 
   final Mutex _compatibilityCheck = Mutex();
+
+  /// Avoid opening multiple databases concurrently.
+  final Mutex openLock = Mutex();
   CompatibilityResult? _compatibilityResult;
 
   /// For shared workers, a dedicated inner worker allowing tabs to connect to
   /// a shared context that can use synchronous JS APIs.
-  Worker? _innerWorker;
+  late final WorkerHandle? _innerWorker = _environment.connector
+      .spawnDedicatedWorker();
 
-  WorkerRunner(this._controller, {WorkerEnvironment? environment})
-      : _environment = environment ?? WorkerEnvironment();
+  WorkerRunner(this._controller, this._environment);
 
   void handleRequests() async {
     await for (final message in _environment.topLevelRequests) {
-      if (message is ConnectRequest) {
-        final channel = message.endpoint.connect();
+      if (message.type == MessageType.connect.name) {
+        final channel = (message as ConnectRequest).endpoint.connect();
         _accept(channel);
-      } else if (message is StartFileSystemServer) {
-        final worker = await VfsWorker.create(message.options);
-        // Inform the requester that the VFS is ready
-        (_environment as Dedicated).scope.postMessage(true.toJS);
-        await worker.start();
-      } else if (message is CompatibilityCheck) {
+      } else if (isCompatibilityCheck(message.type)) {
         // A compatibility check message is sent to dedicated workers inside of
         // shared workers, we respond through the top-level port.
-        final result = await checkCompatibility(message);
-        (_environment as Dedicated).scope.postMessage(result.toJS);
+        final result = await checkCompatibility(message as CompatibilityCheck);
+        (globalContext as DedicatedWorkerGlobalScope).postMessage(result.toJS);
       }
     }
   }
 
-  _ClientConnection _accept(StreamChannel<Message> channel) {
+  _ClientConnection _accept(ConnectableChannel channel) {
     final connection = _ClientConnection(
-        runner: this, channel: channel, id: _nextConnectionId++);
+      runner: this,
+      channel: channel,
+      id: _nextConnectionId++,
+    );
     _connections.add(connection);
-    connection.closed.whenComplete(() => _connections.remove(connection));
+    connection.closed.whenComplete(() => _removeClient(connection));
 
     return connection;
+  }
+
+  void _removeClient(_ClientConnection connection) {
+    _connections.remove(connection);
+    if (_connections.isEmpty) _environment.close();
   }
 
   Future<CompatibilityResult> checkCompatibility(CompatibilityCheck check) {
@@ -709,7 +781,7 @@ final class WorkerRunner {
       if (check.shouldCheckOpfsCompatibility) {
         (
           basicSupport: supportsOpfs,
-          supportsReadWriteUnsafe: opfsSupportsReadWriteUnsafe
+          supportsReadWriteUnsafe: opfsSupportsReadWriteUnsafe,
         ) = await checkOpfsSupport();
       }
 
@@ -720,19 +792,18 @@ final class WorkerRunner {
       var sharedCanSpawnDedicated = false;
       final existingDatabases = <ExistingDatabase>{};
 
-      if (check.type == MessageType.sharedCompatibilityCheck) {
-        if (globalContext.has('Worker')) {
+      if (check.type == MessageType.sharedCompatibilityCheck.name) {
+        if (_innerWorker case final innerWorker?) {
           sharedCanSpawnDedicated = true;
 
-          final worker = useOrSpawnInnerWorker();
-          CompatibilityCheck(
+          newDedicatedInSharedCompatibilityCheck(
             databaseName: databaseName,
-            type: MessageType.dedicatedInSharedCompatibilityCheck,
             requestId: 0,
-          ).sendToWorker(worker);
+          ).sendToWorker(innerWorker);
 
-          final response =
-              await EventStreamProviders.messageEvent.forTarget(worker).first;
+          final response = await EventStreamProviders.messageEvent
+              .forTarget(innerWorker.targetForErrorEvents)
+              .first;
           final result = CompatibilityResult.fromJS(response.data as JSObject);
 
           supportsOpfs = result.canUseOpfs;
@@ -758,34 +829,40 @@ final class WorkerRunner {
         canUseOpfs: supportsOpfs,
         opfsSupportsReadWriteUnsafe: opfsSupportsReadWriteUnsafe,
         canUseIndexedDb: supportsIndexedDb,
-        supportsSharedArrayBuffers: globalContext.has('SharedArrayBuffer'),
-        dedicatedWorkersCanNest: globalContext.has('Worker'),
       );
     });
   }
 
-  Future<void> loadWasmModule(Uri uri) async {
+  Future<void> loadWasmModule(String url) async {
+    final resolved = URL(url, (globalContext['location'] as URL).href).href;
+
     if (_sqlite3 != null) {
-      if (_wasmUri != uri) {
+      if (_wasmUri != resolved) {
         throw StateError(
-            'Workers only support a single sqlite3 wasm module, provided '
-            'different URI (has $_wasmUri, got $uri)');
+          'Workers only support a single sqlite3 wasm module, provided '
+          'different URI (has $_wasmUri, got $resolved)',
+        );
       }
 
       await _sqlite3;
     } else {
-      final future = _sqlite3 =
-          _controller.loadWasmModule(uri).onError((error, stackTrace) {
+      final future = _sqlite3 = _controller.loadWasmModule(resolved).onError((
+        error,
+        stackTrace,
+      ) {
         _sqlite3 = null;
         throw error!;
       });
       await future;
-      _wasmUri = uri;
+      _wasmUri = resolved;
     }
   }
 
   DatabaseState findDatabase(
-      String name, FileSystemImplementation mode, JSAny? additionalOptions) {
+    String name,
+    FileSystemImplementation mode,
+    JSAny? additionalOptions,
+  ) {
     for (final existing in openedDatabases.values) {
       if (existing.refCount != 0 &&
           existing.name == name &&
@@ -803,10 +880,6 @@ final class WorkerRunner {
       mode: mode,
       additionalOptions: additionalOptions,
     );
-  }
-
-  Worker useOrSpawnInnerWorker() {
-    return _innerWorker ??= Worker(Uri.base.toString().toJS);
   }
 }
 
@@ -828,9 +901,13 @@ Future<OpfsSupport> checkOpfsSupport() async {
   FileSystemDirectoryHandle? opfsRoot;
   FileSystemFileHandle? fileHandle;
   JSObject? openedFile;
+  HeldLock? lock;
   var canOpenWithReadWriteUnsafe = false;
 
   try {
+    // We can't use OPFS concurrently, this avoids races when multiple tabs try
+    // to open a database at the same time.
+    lock = await WebLocks.instance?.request(testFileName);
     opfsRoot = await storage.directory;
 
     fileHandle = await opfsRoot.openFile(testFileName, create: true);
@@ -849,11 +926,12 @@ Future<OpfsSupport> checkOpfsSupport() async {
 
     return (
       basicSupport: true,
-      supportsReadWriteUnsafe: canOpenWithReadWriteUnsafe
+      supportsReadWriteUnsafe: canOpenWithReadWriteUnsafe,
     );
   } on Object {
     return noSupport;
   } finally {
+    lock?.release();
     if (openedFile != null) {
       (openedFile as FileSystemSyncAccessHandle).close();
     }
@@ -865,21 +943,24 @@ Future<OpfsSupport> checkOpfsSupport() async {
 }
 
 Future<(bool, FileSystemSyncAccessHandle)> _tryOpeningWithReadWriteUnsafe(
-    FileSystemFileHandle handle) async {
+  FileSystemFileHandle handle,
+) async {
   FileSystemSyncAccessHandle? opened;
 
   try {
     // First, try opening with readwrite-unsafe
     opened = await ProposedLockingSchemeApi(handle)
         .createSyncAccessHandle(
-            FileSystemCreateSyncAccessHandleOptions.unsafeReadWrite())
+          FileSystemCreateSyncAccessHandleOptions.unsafeReadWrite(),
+        )
         .toDart;
 
     // The mode is supported if we can do it again (that means no lock has been
     // applied).
     final openedAgain = await ProposedLockingSchemeApi(handle)
         .createSyncAccessHandle(
-            FileSystemCreateSyncAccessHandleOptions.unsafeReadWrite())
+          FileSystemCreateSyncAccessHandleOptions.unsafeReadWrite(),
+        )
         .toDart;
     openedAgain.close();
 

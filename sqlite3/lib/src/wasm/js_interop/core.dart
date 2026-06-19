@@ -2,6 +2,9 @@ import 'dart:async';
 import 'dart:js_interop';
 import 'dart:js_interop_unsafe';
 
+import '../../compile_options.dart';
+import '../../platform/web.dart';
+
 @JS('BigInt')
 external JSBigInt _bigInt(JSAny? s);
 
@@ -27,7 +30,13 @@ extension type JsBigInt(JSBigInt _jsBigInt) implements JSBigInt {
 
   int get asDartInt => _number(_jsBigInt).toDartInt;
 
-  BigInt get asDartBigInt => BigInt.parse(jsToString());
+  Object get asDartBigInt {
+    if (!supportDartBigInts) {
+      return BoxedJavaScriptBigInt(this);
+    }
+
+    return BigInt.parse(jsToString());
+  }
 
   JSBigInt get jsObject => _jsBigInt;
 
@@ -69,14 +78,20 @@ class AsyncJavaScriptIteratable<T extends JSAny?> extends Stream<T> {
 
   AsyncJavaScriptIteratable(this._jsObject) {
     if (!_jsObject.hasProperty(_asyncIterator).toDart) {
-      throw ArgumentError('Target object does not implement the async iterable '
-          'interface');
+      throw ArgumentError(
+        'Target object does not implement the async iterable '
+        'interface',
+      );
     }
   }
 
   @override
-  StreamSubscription<T> listen(void Function(T event)? onData,
-      {Function? onError, void Function()? onDone, bool? cancelOnError}) {
+  StreamSubscription<T> listen(
+    void Function(T event)? onData, {
+    Function? onError,
+    void Function()? onDone,
+    bool? cancelOnError,
+  }) {
     final iterator = _jsObject.callMethod<AsyncIterator<T>>(_asyncIterator);
     final controller = StreamController<T>(sync: true);
     JSPromise<IteratorResult<T>>? currentlyPendingPromise;
@@ -85,26 +100,23 @@ class AsyncJavaScriptIteratable<T extends JSAny?> extends Stream<T> {
       assert(currentlyPendingPromise == null);
       final promise = currentlyPendingPromise = iterator.next();
 
-      promise.toDart.then(
-        (result) {
-          final done = result.done?.toDart ?? false;
-          final value = result.value;
+      promise.toDart.then((result) {
+        final done = result.done?.toDart ?? false;
+        final value = result.value;
 
-          if (done) {
-            controller.close();
+        if (done) {
+          controller.close();
 
-            currentlyPendingPromise = null;
-          } else {
-            controller.add(value as T);
+          currentlyPendingPromise = null;
+        } else {
+          controller.add(value as T);
 
-            currentlyPendingPromise = null;
-            if (!controller.isPaused) {
-              fetchNext();
-            }
+          currentlyPendingPromise = null;
+          if (!controller.isPaused) {
+            fetchNext();
           }
-        },
-        onError: controller.addError,
-      );
+        }
+      }, onError: controller.addError);
     }
 
     void fetchNextIfNecessary() {

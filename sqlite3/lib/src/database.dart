@@ -112,13 +112,19 @@ abstract class CommonDatabase {
   ///   - [Commit Hooks](https://www.sqlite.org/c3ref/commit_hook.html)
   Stream<void> get rollbacks;
 
-  /// Executes the [sql] statement with the provided [parameters], ignoring any
-  /// rows returned by the statement.
+  /// Executes the [sql] statement(s) with the provided [parameters], ignoring
+  /// any rows returned by the statement(s).
   ///
   /// For the types supported in [parameters], see [StatementParameters].
   /// To view rows returned by a statement, run it with [select]. Statements
   /// that aren't `SELECT`s in SQL but still return rows (such as updates with
   /// a `RETURNING` clause) can still be safely executed with [select].
+  ///
+  /// When no [parameters] are passed to [execute], [sql] is allowed to contain
+  /// multiple SQL statements (separated by a semicolon). Those statements will
+  /// be executed in order, but [execute] will not start a transaction for them
+  /// automatically. If any statement fails, that exception will be thrown and
+  /// subsequent statements will not be executed.
   void execute(String sql, [List<Object?> parameters = const []]);
 
   /// Prepares the [sql] statement and runs it with the provided [parameters],
@@ -140,7 +146,7 @@ abstract class CommonDatabase {
   /// The [persistent] flag can be used as a hint to the query planner that the
   /// statement will be retained for a long time and probably reused many times.
   /// Without this flag, sqlite assumes that the prepared statement will be used
-  /// just once or at most a few times before [CommonPreparedStatement.dispose]
+  /// just once or at most a few times before [CommonPreparedStatement.close]
   /// is called.
   /// If [vtab] is disabled (it defaults to `true`) and the statement references
   /// a virtual table, [prepare] throws an exception.
@@ -149,8 +155,12 @@ abstract class CommonDatabase {
   /// If [checkNoTail] is enabled (it defaults to `false`) and the [sql] string
   /// contains trailing data, an exception will be thrown and the statement will
   /// not be executed.
-  CommonPreparedStatement prepare(String sql,
-      {bool persistent = false, bool vtab = true, bool checkNoTail = false});
+  CommonPreparedStatement prepare(
+    String sql, {
+    bool persistent = false,
+    bool vtab = true,
+    bool checkNoTail = false,
+  });
 
   /// Compiles multiple statements from [sql] to be executed later.
   ///
@@ -161,8 +171,11 @@ abstract class CommonDatabase {
   /// return `2` prepared statements.
   ///
   /// For the [persistent] and [vtab] parameters, see [prepare].
-  List<CommonPreparedStatement> prepareMultiple(String sql,
-      {bool persistent = false, bool vtab = true});
+  List<CommonPreparedStatement> prepareMultiple(
+    String sql, {
+    bool persistent = false,
+    bool vtab = true,
+  });
 
   /// Creates a collation that can be used from sql queries sent against
   /// this database.
@@ -257,6 +270,20 @@ abstract class CommonDatabase {
     bool subtype = false,
   });
 
+  /// Installs a function to invoke whenever an attempt is made to access a
+  /// database table when another thread or process has the table locked.
+  ///
+  /// The argument passed to the [handler] is the amount of times it has
+  /// previously been invoked for the same locking event.
+  /// The handler should return `true` if SQLite should make another attempt to
+  /// access the database, or `false` if SQLite should stop making attempts and
+  /// return `SQLITE_BUSY`.
+  ///
+  /// Note that using the `busy_timeout` pragma will overwrite this handler.
+  ///
+  /// See also: https://www.sqlite.org/c3ref/busy_handler.html
+  set busyHandler(bool Function(int count)? handler);
+
   /// Checks whether the connection is in autocommit mode. The connection is in
   /// autocommit by default, except when inside a transaction.
   ///
@@ -264,7 +291,15 @@ abstract class CommonDatabase {
   bool get autocommit;
 
   /// Closes this database and releases associated resources.
+  @Deprecated('Call close() instead')
   void dispose();
+
+  /// Closes this database and releases associated resources.
+  ///
+  /// On native platforms, a native finalizer will also close the connection
+  /// automatically. On the web, finalizers are less reliable. For this reason,
+  /// closing databases explicitly is still recommended.
+  void close();
 }
 
 /// The kind of an [SqliteUpdate] received through a [CommonDatabase.updates]

@@ -1,19 +1,15 @@
 import 'dart:ffi';
 
-import '../../open.dart';
 import '../database.dart';
 import '../sqlite3.dart';
 import '../statement.dart';
+import 'libsqlite3.g.dart' as libsqlite3;
 import 'implementation.dart';
-
-Sqlite3? _sqlite3;
 
 /// Provides access to `sqlite3` functions, such as opening new databases.
 ///
 /// {@category native}
-Sqlite3 get sqlite3 {
-  return _sqlite3 ??= FfiSqlite3(open.openSqlite());
-}
+const Sqlite3 sqlite3 = FfiSqlite3();
 
 /// Provides access to `sqlite3` functions, such as opening new databases.
 ///
@@ -32,7 +28,13 @@ abstract interface class Sqlite3 implements CommonSqlite3 {
   ///
   /// The [database] must be a pointer towards an open sqlite3 database
   /// connection [handle](https://www.sqlite.org/c3ref/sqlite3.html).
-  Database fromPointer(Pointer<void> database);
+  ///
+  /// When [borrowed] is set (it defaults to `false`), the returned [Database]
+  /// connection acts as a view of the underlying `sqlite3*` pointer. The
+  /// library will not attach a native finalizer calling `sqlite3_close_v2`, and
+  /// calling [Database.close] in it will only prevent further interactions from
+  /// Dart.
+  Database fromPointer(Pointer<void> database, {bool borrowed = false});
 
   @override
   Database openInMemory({String? vfs});
@@ -46,6 +48,29 @@ abstract interface class Sqlite3 implements CommonSqlite3 {
   /// For a more in-depth discussion, including links to an example, see the
   /// documentation for [SqliteExtension].
   void ensureExtensionLoaded(SqliteExtension extension);
+
+  /// Whether the option, specified by its name, was defined at compile-time.
+  ///
+  /// The `SQLITE_` prefix may be omitted from the option [name].
+  ///
+  /// See also: https://sqlite.org/c3ref/compileoption_get.html
+  bool usedCompileOption(String name);
+
+  /// An iterable over the list of options that were defined at compile time.
+  ///
+  /// See also: https://sqlite.org/c3ref/compileoption_get.html
+  Iterable<String> get compileOptions;
+
+  /// A function pointer to `sqlite3_close_v2`.
+  ///
+  /// This typically shouldn't be used directly since this library attaches
+  /// native finalizers to databases by default, but can be used for custom
+  /// connection management if necessary.
+  ///
+  /// See also: https://sqlite.org/c3ref/close.html
+  @Deprecated("Import 'package:sqlite3/unstable/ffi_bindings.dart' instead")
+  static Pointer<NativeFunction<Int Function(Pointer<Void>)>>
+  get sqliteCloseV2 => libsqlite3.addresses.sqlite3_close_v2.cast();
 }
 
 /// Information used to load an extension through `sqlite3_auto_extension`,
@@ -73,27 +98,13 @@ abstract interface class SqliteExtension {
   /// For the exact signature of [extensionEntrypoint], see
   /// [sqlite3_auto_extension](https://www.sqlite.org/c3ref/auto_extension.html).
   factory SqliteExtension(Pointer<Void> extensionEntrypoint) {
-    return SqliteExtensionImpl((_) => extensionEntrypoint);
+    return SqliteExtensionImpl(() => extensionEntrypoint);
   }
 
   /// A sqlite extension from another library with a given symbol as an
   /// entrypoint.
   factory SqliteExtension.inLibrary(DynamicLibrary library, String symbol) {
-    return SqliteExtensionImpl((_) => library.lookup(symbol));
-  }
-
-  /// A sqlite extension assumed to be statically linked into the sqlite3
-  /// library loaded by this package.
-  ///
-  /// In most sqlite3 distributions, including the one from `sqlite3_flutter_libs`,
-  /// no extensions are available this way.
-  ///
-  /// One example where an extension would be available is if you added a
-  /// native dependency on the `sqlite3/spellfix1` pod on iOS or macOS. On those
-  /// platforms, you could then load the  [spellfix](https://www.sqlite.org/spellfix1.html)
-  /// extension with `SqliteExtension.staticallyLinked('sqlite3_spellfix_init')`.
-  factory SqliteExtension.staticallyLinked(String symbol) {
-    return SqliteExtensionImpl((library) => library!.lookup(symbol));
+    return SqliteExtensionImpl(() => library.lookup(symbol));
   }
 }
 
@@ -108,16 +119,53 @@ abstract class Database extends CommonDatabase {
   ///
   /// This returns a pointer towards the opaque sqlite3 structure as defined
   /// [here](https://www.sqlite.org/c3ref/sqlite3.html).
+  ///
+  /// Note that the connection is still owned by this Dart object, and will be
+  /// closed once it becomes unreachable. In other words, the returned handle is
+  /// a logical reference to this object.
+  /// To transfer ownership of the connection out of this object, use [leak]
+  /// instead.
   Pointer<void> get handle;
+
+  /// Like [handle], this returns the native `sqlite3*` pointer wrapped by this
+  /// instance.
+  ///
+  /// Additionally, this also detaches native finalizers that would close the
+  /// connection once this object becomes unreachable.
+  ///
+  /// This is an advanced and low-level API that can be used to transfer
+  /// ownership of connections originally opened in Dart to native code.
+  Pointer<void> leak();
 
   // override for more specific subtype
   @override
-  PreparedStatement prepare(String sql,
-      {bool persistent = false, bool vtab = true, bool checkNoTail = false});
+  PreparedStatement prepare(
+    String sql, {
+    bool persistent = false,
+    bool vtab = true,
+    bool checkNoTail = false,
+  });
 
   @override
-  List<PreparedStatement> prepareMultiple(String sql,
-      {bool persistent = false, bool vtab = true});
+  List<PreparedStatement> prepareMultiple(
+    String sql, {
+    bool persistent = false,
+    bool vtab = true,
+  });
+
+  /// Creates a Dart [PreparedStatement] instance from the underlying
+  /// `sqlite3_stmt` pointer.
+  ///
+  /// When [borrowed] is set (it defaults to `false`), the returned [Database]
+  /// connection acts as a view of the underlying `sqlite3_stmt*` pointer. The
+  /// library will not attach a native finalizer calling `sqlite3_finalize`, and
+  /// calling [PreparedStatement.close] in it will only prevent further
+  /// interactions from Dart.
+  PreparedStatement statementFromPointer({
+    required Pointer<void> statement,
+    required String sql,
+    bool borrowed = false,
+  });
 
   /// Create a backup of the current database (this) into another database
   /// ([toDatabase]) on memory or disk.
@@ -147,5 +195,21 @@ abstract class PreparedStatement implements CommonPreparedStatement {
   ///
   /// Obtains the raw [statement](https://www.sqlite.org/c3ref/stmt.html) from
   /// the sqlite3 C-api that this [PreparedStatement] wraps.
+  ///
+  /// Note that the statement is still owned by this Dart object, and will be
+  /// finalized once it becomes unreachable. In other words, the returned handle
+  /// is a logical reference to this object.
+  /// To transfer ownership of the statement out of this object, use [leak]
+  /// instead.
   Pointer<void> get handle;
+
+  /// Like [handle], this returns the native `sqlite3_stmt*` pointer wrapped by
+  /// this instance.
+  ///
+  /// Additionally, this also detaches native finalizers that would close the
+  /// statement once this object becomes unreachable.
+  ///
+  /// This is an advanced and low-level API that can be used to transfer
+  /// ownership of statements originally opened in Dart to native code.
+  Pointer<void> leak();
 }
